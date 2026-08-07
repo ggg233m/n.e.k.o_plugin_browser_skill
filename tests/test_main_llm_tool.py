@@ -1,0 +1,378 @@
+from __future__ import annotations
+
+import asyncio
+from types import MethodType, SimpleNamespace
+from typing import Any
+
+import pytest
+from plugin.plugins.browser_skill import BrowserSkillPlugin
+from plugin.sdk.plugin.llm_tool import collect_llm_tool_methods
+
+
+class _Logger:
+    def exception(self, *_args: Any, **_kwargs: Any) -> None:
+        pass
+
+
+class _Runtime:
+    def __init__(self) -> None:
+        self.steer_calls: list[dict[str, Any]] = []
+        self.close_calls: list[str | None] = []
+        self.active = False
+
+    def get_status(self, _conversation_id: str | None = None) -> dict[str, object]:
+        return {
+            "active": self.active,
+            "stage": "starting_session",
+            "message": "正在启动 BrowserSkill",
+        }
+
+    async def steer(self, **kwargs: Any) -> dict[str, object]:
+        self.steer_calls.append(kwargs)
+        return {"accepted": True, "active": True, "message": "已更新执行方向"}
+
+    async def close(self, conversation_id: str | None = None) -> None:
+        self.close_calls.append(conversation_id)
+
+
+def _plugin() -> BrowserSkillPlugin:
+    plugin = object.__new__(BrowserSkillPlugin)
+    plugin._settings = SimpleNamespace(session_scope="lanlan")
+    plugin._runtime = _Runtime()
+    plugin._direct_tasks = {}
+    plugin.logger = _Logger()
+    plugin.pushed = []
+
+    def fake_push(self: BrowserSkillPlugin, **kwargs: Any) -> None:
+        self.pushed.append(kwargs)
+
+    plugin.push_message = MethodType(fake_push, plugin)
+    return plugin
+
+
+def test_browser_skill_exposes_one_native_main_llm_tool() -> None:
+    tools = collect_llm_tool_methods(object.__new__(BrowserSkillPlugin))
+
+    assert [(meta.name, method.__name__) for meta, method in tools] == [
+        ("run_browser_task", "run_browser_task_tool")
+    ]
+    assert tools[0][0].timeout_seconds == 15
+    assert tools[0][0].parameters["required"] == ["operation", "tab_count"]
+
+    for entry_name in ("run_browser_task", "get_browser_task_status", "steer_browser_task"):
+        meta = getattr(getattr(BrowserSkillPlugin, entry_name), "__neko_event_meta__")
+        assert meta.metadata["agent_hidden"] is True
+
+
+def test_auto_routing_adds_fallback_for_uncertain_native_routes() -> None:
+    plugin = object.__new__(BrowserSkillPlugin)
+    plugin._settings = SimpleNamespace(routing_mode="auto")
+    plugin._native_route_supported = MethodType(lambda self: False, plugin)
+    assert plugin._resolve_routing_mode() == "hybrid"
+    plugin._native_route_supported = MethodType(lambda self: True, plugin)
+    assert plugin._resolve_routing_mode() == "native"
+    plugin._settings = SimpleNamespace(routing_mode="fallback")
+    assert plugin._resolve_routing_mode() == "fallback"
+
+
+def test_recoverable_failure_recommends_only_one_automatic_retry() -> None:
+    plugin = object.__new__(BrowserSkillPlugin)
+    plugin._recovery_attempts = {}
+    first = {
+        "success": False,
+        "status": "failed",
+        "session_state": "kept",
+        "error": {"code": "ELEMENT_NOT_FOUND", "retryable": True},
+    }
+    second = dict(first)
+
+    plugin._add_recovery_metadata(
+        first,
+        task_key="chat-1",
+        request_fingerprint="request-a",
+    )
+    plugin._add_recovery_metadata(
+        second,
+        task_key="chat-1",
+        request_fingerprint="request-a",
+    )
+
+    assert first["recovery_recommended"] is True
+    assert second["recovery_recommended"] is False
+    assert second["recovery_reason"] == ""
+
+
+def test_success_result_has_empty_recovery_reason_required_by_host_schema() -> None:
+    plugin = object.__new__(BrowserSkillPlugin)
+    plugin._recovery_attempts = {}
+    result = {
+        "success": True,
+        "status": "completed",
+        "session_state": "kept",
+        "error": None,
+    }
+
+    plugin._add_recovery_metadata(
+        result,
+        task_key="chat-1",
+        request_fingerprint="request-a",
+    )
+
+    assert result["recovery_recommended"] is False
+    assert result["recovery_reason"] == ""
+
+
+@pytest.mark.asyncio
+async def test_native_tool_starts_long_run_in_background() -> None:
+    plugin = _plugin()
+    release = asyncio.Event()
+    observed: dict[str, Any] = {}
+
+    async def fake_run(self: BrowserSkillPlugin, **kwargs: Any) -> dict[str, Any]:
+        observed.update(kwargs)
+        await release.wait()
+        return {
+            "data": {
+                "success": True,
+                "status": "completed",
+                "summary": "已经搜到小猫视频",
+                "session_state": "kept",
+            }
+        }
+
+    plugin.run_browser_task = MethodType(fake_run, plugin)
+
+    result = await plugin.run_browser_task_tool(
+        operation="run",
+        instruction="搜索可爱小猫视频",
+        _ctx={"lanlan_name": "然然", "latest_user_request": "搜索可爱小猫视频"},
+    )
+
+    assert result.is_ok()
+    assert result.value["accepted"] is True
+    assert result.value["status"] == "running"
+    assert observed["instruction"] == "搜索可爱小猫视频"
+    assert observed["_ctx"]["lanlan_name"] == "然然"
+    assert observed["_ctx"]["invocation_source"] == "main_llm_tool"
+    assert len(plugin._direct_tasks) == 1
+
+    release.set()
+    await asyncio.gather(*list(plugin._direct_tasks.values()))
+    await asyncio.sleep(0)
+    assert plugin._direct_tasks == {}
+    assert len(plugin.pushed) == 1
+    assert plugin.pushed[0]["source"] == "browser_skill.task_result"
+    assert plugin.pushed[0]["ai_behavior"] == "respond"
+    assert plugin.pushed[0]["target_lanlan"] == "然然"
+    assert plugin.pushed[0]["priority"] == 20
+    assert plugin.pushed[0]["coalesce_key"].startswith("browser_skill.task_result:")
+    assert "authoritative latest result for this browser task: SUCCESS" in (
+        plugin.pushed[0]["parts"][0]["text"]
+    )
+    assert '"authoritative_latest_result":true' in plugin.pushed[0]["parts"][0]["text"]
+    assert '"authoritative_outcome":"success"' in plugin.pushed[0]["parts"][0]["text"]
+    assert "已经搜到小猫视频" in plugin.pushed[0]["parts"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_native_tool_preserves_explicit_tab_count_outside_instruction_summary() -> None:
+    plugin = _plugin()
+    release = asyncio.Event()
+    observed: dict[str, Any] = {}
+
+    async def fake_run(self: BrowserSkillPlugin, **kwargs: Any) -> dict[str, Any]:
+        observed.update(kwargs)
+        await release.wait()
+        return {"data": {"success": True, "status": "completed"}}
+
+    plugin.run_browser_task = MethodType(fake_run, plugin)
+    result = await plugin.run_browser_task_tool(
+        operation="run",
+        instruction="先搜索晴天，再打开猫娘计划 GitHub",
+        tab_count=2,
+        _ctx={"lanlan_name": "然然"},
+    )
+
+    assert result.is_ok()
+    assert observed["requested_tab_count"] == 2
+    assert "总共 2 个标签页" in observed["instruction"]
+    release.set()
+    await asyncio.gather(*list(plugin._direct_tasks.values()))
+
+
+@pytest.mark.asyncio
+async def test_recoverable_terminal_result_tells_main_llm_to_retry_without_asking() -> None:
+    plugin = _plugin()
+
+    async def fake_run(self: BrowserSkillPlugin, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "data": {
+                "success": False,
+                "status": "failed",
+                "summary": "没有找到搜索框",
+                "session_state": "kept",
+                "recovery_recommended": True,
+                "error": {"code": "ELEMENT_NOT_FOUND", "retryable": True},
+            }
+        }
+
+    plugin.run_browser_task = MethodType(fake_run, plugin)
+    await plugin._run_direct_background(
+        instruction="在百度搜索小猫视频",
+        start_url=None,
+        final_session_action="defer",
+        context={"lanlan_name": "然然", "latest_user_request": "搜索小猫视频"},
+    )
+
+    text = plugin.pushed[0]["parts"][0]["text"]
+    assert "Immediately call run_browser_task once" in text
+    assert "Do not ask the user merely" in text
+
+
+@pytest.mark.asyncio
+async def test_native_tool_steers_existing_task_without_starting_another() -> None:
+    plugin = _plugin()
+
+    result = await plugin.run_browser_task_tool(
+        operation="replace",
+        instruction="改成搜索小狗视频",
+        _ctx={"lanlan_name": "然然", "latest_user_request": "改成小狗"},
+    )
+
+    assert result.is_ok()
+    assert result.value["accepted"] is True
+    assert plugin._direct_tasks == {}
+    assert plugin._runtime.steer_calls == [
+        {
+            "conversation_id": "lanlan:e98b2952b5bd7b03e659",
+            "mode": "replace",
+            "requirement": "改成搜索小狗视频",
+            "user_request": "改成小狗",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_tool_close_cancels_background_task_without_terminal_duplicate() -> None:
+    plugin = _plugin()
+    never = asyncio.Event()
+
+    async def fake_run(self: BrowserSkillPlugin, **_kwargs: Any) -> dict[str, Any]:
+        await never.wait()
+        return {"data": {"success": True, "status": "completed"}}
+
+    plugin.run_browser_task = MethodType(fake_run, plugin)
+    context = {"lanlan_name": "然然", "latest_user_request": "搜索小猫"}
+    await plugin.run_browser_task_tool(
+        operation="run",
+        instruction="搜索小猫",
+        _ctx=context,
+    )
+    assert len(plugin._direct_tasks) == 1
+
+    result = await plugin.run_browser_task_tool(operation="close", _ctx=context)
+
+    assert result.is_ok()
+    assert result.value["session_state"] == "closed"
+    assert plugin._direct_tasks == {}
+    assert plugin.pushed == []
+    assert plugin._runtime.close_calls == ["lanlan:e98b2952b5bd7b03e659"]
+
+
+@pytest.mark.asyncio
+async def test_native_and_fallback_surfaces_dedupe_the_same_user_turn_both_directions() -> None:
+    context = {"lanlan_name": "然然", "latest_user_request": "开始搜索小猫视频"}
+
+    native_first = _plugin()
+    native_release = asyncio.Event()
+    native_calls = 0
+
+    async def native_run(self: BrowserSkillPlugin, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal native_calls
+        native_calls += 1
+        await native_release.wait()
+        return {"data": {"success": True, "status": "completed"}}
+
+    native_first.run_browser_task = MethodType(native_run, native_first)
+    await native_first.run_browser_task_tool(
+        operation="run",
+        instruction="搜索小猫视频",
+        _ctx=context,
+    )
+    fallback_waiter = asyncio.create_task(
+        native_first._run_browser_task_fallback(
+            instruction="从百度搜索小猫视频",
+            _ctx=context,
+        )
+    )
+    await asyncio.sleep(0)
+    assert fallback_waiter.done() is False
+    assert native_calls == 1
+    native_release.set()
+    fallback_result = await fallback_waiter
+    assert fallback_result["data"]["status"] == "completed"
+    assert native_calls == 1
+    await asyncio.sleep(0)
+    assert native_first._direct_tasks == {}
+
+    fallback_first = _plugin()
+    fallback_calls = 0
+
+    async def fallback_run(self: BrowserSkillPlugin, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return {"data": {"success": True, "status": "completed"}}
+
+    fallback_first.run_browser_task = MethodType(fallback_run, fallback_first)
+    await fallback_first._run_browser_task_fallback(
+        instruction="从百度搜索小猫视频",
+        _ctx=context,
+    )
+    native_result = await fallback_first.run_browser_task_tool(
+        operation="run",
+        instruction="搜索小猫视频",
+        _ctx=context,
+    )
+    assert native_result.is_ok()
+    assert native_result.value["deduplicated"] is True
+    assert fallback_calls == 1
+    assert fallback_first._direct_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_cancelling_joined_fallback_also_stops_native_background_task() -> None:
+    plugin = _plugin()
+    context = {"lanlan_name": "然然", "latest_user_request": "搜索小猫视频"}
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def native_run(self: BrowserSkillPlugin, **_kwargs: Any) -> dict[str, Any]:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    plugin.run_browser_task = MethodType(native_run, plugin)
+    await plugin.run_browser_task_tool(
+        operation="run",
+        instruction="搜索小猫视频",
+        _ctx=context,
+    )
+    await started.wait()
+    fallback_waiter = asyncio.create_task(
+        plugin._run_browser_task_fallback(
+            instruction="从百度搜索小猫视频",
+            _ctx=context,
+        )
+    )
+    await asyncio.sleep(0)
+
+    fallback_waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await fallback_waiter
+    await asyncio.sleep(0)
+
+    assert cancelled.is_set()
+    assert plugin._direct_tasks == {}
