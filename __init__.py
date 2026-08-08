@@ -108,6 +108,67 @@ def _live_status_payload(status: dict[str, object]) -> dict[str, object]:
     return {key: status[key] for key in allowed if key in status}
 
 
+_HUD_STAGE_TEXT = {
+    "preflight": "正在检查浏览器连接",
+    "starting": "正在启动",
+    "starting_session": "正在连接浏览器窗口",
+    "observing": "正在读取页面",
+    "planning": "正在规划下一步",
+    "acting": "正在操作页面",
+    "verifying": "正在核对执行结果",
+    "steering": "正在应用主模型的新指令",
+    "waiting_for_user": "正在等待用户完成页面操作",
+    "cleaning_up": "正在整理执行结果",
+    "completed": "已完成",
+    "failed": "执行未完成",
+    "needs_user": "需要用户继续处理",
+    "cancelled": "已取消",
+}
+
+_HUD_ACTION_TEXT = {
+    "navigate": "正在打开页面",
+    "navigate_back": "正在返回上一页",
+    "navigate_forward": "正在前往下一页",
+    "reload": "正在刷新页面",
+    "snapshot": "正在读取页面",
+    "observe": "正在深入读取页面",
+    "get_html": "正在检查页面结构",
+    "screenshot": "正在查看页面画面",
+    "click": "正在点击页面控件",
+    "fill": "正在填写页面内容",
+    "select": "正在选择页面选项",
+    "press": "正在发送按键",
+    "scroll": "正在滚动页面",
+    "wait_for_navigation": "正在等待页面跳转",
+    "tab_list": "正在检查浏览器标签页",
+    "tab_create": "正在新建标签页",
+    "tab_select": "正在切换标签页",
+    "borrow_tab": "正在接入用户标签页",
+    "return_tab": "正在归还用户标签页",
+    "request_help": "正在等待用户完成页面操作",
+    "done": "正在核对执行结果",
+    "fail": "正在整理失败信息",
+}
+
+
+def _hud_live_status_text(status: dict[str, object]) -> str:
+    """Build a short HUD-only progress line without page or model-generated text."""
+    stage = str(status.get("stage") or "").strip().lower()
+    action = str(status.get("current_action") or "").strip().lower()
+    terminal_status = str(status.get("terminal_status") or "").strip().lower()
+    if terminal_status:
+        stage = terminal_status
+    text = _HUD_ACTION_TEXT.get(action) if stage == "acting" else None
+    text = text or _HUD_STAGE_TEXT.get(stage) or "正在执行浏览器任务"
+    try:
+        step = max(0, int(status.get("step") or 0))
+    except (TypeError, ValueError, OverflowError):
+        step = 0
+    if step > 0 and stage not in {"completed", "failed", "needs_user", "cancelled"}:
+        text = f"{text} · 已执行 {step} 个动作"
+    return f"浏览器任务：{text}"[:200]
+
+
 def _steer_reply_payload(payload: dict[str, object]) -> dict[str, object]:
     """Complete the fixed SDK reply contract for every steering outcome."""
     result = dict(payload)
@@ -141,7 +202,9 @@ _MAIN_TOOL_DESCRIPTION = (
     "For a terminal result, authoritative_outcome is the sole outcome source: when it is success, "
     "report success even if an earlier live status or an intermediate browser action failed. "
     "If a terminal result has recovery_recommended=true, immediately call this tool once more with "
-    "operation=run, the same user goal, and a concrete alternate recovery direction based on page. "
+    "operation=run, the same exact target and outcome, changing only the technical route based on page. "
+    "A recovery must not broaden or replace an explicitly chosen site, search engine, query, target, "
+    "message, or completion criterion. "
     "Do not ask the user merely because one selector or element was not found. Never auto-retry when "
     "recovery_recommended=false."
 )
@@ -601,9 +664,10 @@ class BrowserSkillPlugin(NekoPluginBase):
             elif recovery_recommended:
                 directive = (
                     "The authoritative latest result is a recoverable failure. Immediately call "
-                    "run_browser_task once with operation=run, the same user goal, and a concrete "
-                    "alternate recovery direction based on page. Do not ask the user merely because "
-                    "an element was not found."
+                    "run_browser_task once with operation=run, preserving the same exact target and "
+                    "outcome while changing only the technical route based on page. Do not broaden or "
+                    "replace an explicitly chosen site, search engine, query, target, message, or "
+                    "completion criterion. Do not ask the user merely because an element was not found."
                 )
             elif outcome == "needs_user":
                 directive = (
@@ -792,9 +856,10 @@ class BrowserSkillPlugin(NekoPluginBase):
         context_scope = conversation_id or lanlan_name or "one-shot"
         context_key = hashlib.sha256(context_scope.encode("utf-8")).hexdigest()[:16]
         last_live_fingerprint = ""
+        last_hud_fingerprint = ""
 
         async def report(**payload: Any) -> None:
-            nonlocal last_live_fingerprint
+            nonlocal last_hud_fingerprint, last_live_fingerprint
             if payload.get("progress") is not None:
                 payload["progress"] = min(1.0, max(0.0, float(payload["progress"])))
             if not direct_background:
@@ -809,7 +874,29 @@ class BrowserSkillPlugin(NekoPluginBase):
                         type(exc).__name__,
                     )
             try:
-                safe_status = _live_status_payload(self._runtime.get_status(conversation_id))
+                current_status = self._runtime.get_status(conversation_id)
+                hud_text = _hud_live_status_text(current_status)
+                if hud_text != last_hud_fingerprint:
+                    last_hud_fingerprint = hud_text
+                    self.push_message(
+                        source="browser_skill.live_status.hud",
+                        visibility=["hud"],
+                        ai_behavior="blind",
+                        parts=[{"type": "text", "text": hud_text}],
+                        target_lanlan=lanlan_name,
+                        priority=3,
+                        coalesce_key=f"browser_skill.live_status.hud:{context_key}",
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    "BrowserSkill HUD progress update failed: {}",
+                    type(exc).__name__,
+                )
+                current_status = {}
+            try:
+                if not current_status:
+                    current_status = self._runtime.get_status(conversation_id)
+                safe_status = _live_status_payload(current_status)
                 safe_status["page"] = await self._inspect_page(
                     conversation_id,
                     refresh=False,

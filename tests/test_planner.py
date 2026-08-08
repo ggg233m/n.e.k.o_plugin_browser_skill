@@ -107,6 +107,11 @@ async def test_structured_output_capability_fallback_is_cached_by_endpoint(
     payload = json.loads(created[0].messages[0][1]["content"])
     assert payload["execution_goal"] == "Open Example and read only the main heading"
     assert payload["latest_user_request"] == "Please open Example"
+    assert "only the main model may replace it" in payload["controller_contract"]["authority"]
+    assert "equivalent technical routes only" in payload["controller_contract"]["agent_autonomy"]
+    assert "do not change an explicitly selected site/search engine" in payload["controller_contract"]["scope"]
+    assert "when no site or route is specified" in payload["controller_contract"]["scope"]
+    assert "never the task target or outcome" in payload["controller_contract"]["recovery"]
     assert "without paraphrasing" in payload["completion_evidence_contract"]
     assert "visible_evidence_ref" in payload["completion_evidence_contract"]
     assert "original_user_request" not in payload

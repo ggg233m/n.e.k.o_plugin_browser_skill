@@ -479,6 +479,27 @@ class LLMPlanner:
         user_payload = {
             "execution_goal": instruction,
             "latest_user_request": raw_request or instruction,
+            "controller_contract": {
+                "authority": (
+                    "execution_goal is the exact current direction selected by N.E.K.O's main "
+                    "model; it is not a suggestion and only the main model may replace it"
+                ),
+                "agent_autonomy": (
+                    "choose browser actions and equivalent technical routes only within that goal"
+                ),
+                "scope": (
+                    "do not change an explicitly selected site/search engine, query, target item, "
+                    "text to send, requested output, or completion criterion; when no site or route "
+                    "is specified, choose a suitable one within latest_user_request"
+                ),
+                "recovery": (
+                    "page failures may change the technical route but never the task target or outcome"
+                ),
+                "decision_gate": (
+                    "return only an action that directly advances execution_goal; do not add side "
+                    "research, reinterpret the task, or continue an older goal"
+                ),
+            },
             "verification_required": verification_required,
             "completion_evidence_contract": (
                 "If action=done, copy visible_evidence as one contiguous exact substring from "
@@ -534,6 +555,7 @@ class LLMPlanner:
     ) -> AgentAction:
         correction = (
             "Your previous output failed schema validation. Return one corrected JSON action only. "
+            "Keep the exact execution_goal and controller_contract unchanged while correcting shape. "
             f"Validation error: {type(error).__name__}. Previous output: {raw_text[:4000]}"
         )
         set_call_type("agent_browser_skill")
@@ -828,8 +850,10 @@ class AgentLoop:
             history.append(
                 f"The normal recovery ladder was exhausted ({reason}). This is the one automatic alternate-route "
                 "attempt. Do not ask the user for permission and do not immediately fail again. Use a structurally "
-                "different safe route: a different current ref, keyboard activation, reload, another search result, "
-                "or direct navigation to a trustworthy HTTP(S) destination visible in prior evidence."
+                "different safe route that still serves the exact execution_goal: a different current ref, keyboard "
+                "activation, reload, another relevant result, or direct navigation to a trustworthy HTTP(S) "
+                "destination visible in prior evidence. Recovery changes the method only; it must not replace an "
+                "explicit site/search engine, query, target, message, requested output, or completion criterion."
             )
             return True
 

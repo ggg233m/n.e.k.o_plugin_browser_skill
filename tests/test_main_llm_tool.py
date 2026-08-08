@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 from plugin.plugins.browser_skill import BrowserSkillPlugin, _steer_reply_payload
+from plugin.plugins.browser_skill.runtime.models import BrowserTaskResult
 from plugin.sdk.plugin.llm_tool import collect_llm_tool_methods
 
 
@@ -203,6 +204,79 @@ async def test_native_tool_starts_long_run_in_background() -> None:
 
 
 @pytest.mark.asyncio
+async def test_browser_run_emits_separate_hud_and_hidden_live_updates() -> None:
+    plugin = _plugin()
+
+    class ProgressRuntime(_Runtime):
+        status: dict[str, object] = {}
+
+        def get_status(self, _conversation_id: str | None = None) -> dict[str, object]:
+            return dict(self.status)
+
+        async def inspect_page(
+            self,
+            _conversation_id: str | None,
+            *,
+            refresh: bool,
+        ) -> dict[str, object]:
+            return {
+                "available": True,
+                "observation": "private page body",
+                "refresh": refresh,
+            }
+
+        async def run_instruction(self, *_args: Any, **kwargs: Any) -> BrowserTaskResult:
+            self.status = {
+                "active": True,
+                "stage": "acting",
+                "step": 2,
+                "current_action": "click",
+            }
+            await kwargs["progress"](stage="acting", message="click", step=2)
+            self.status = {
+                "active": False,
+                "stage": "completed",
+                "step": 2,
+                "terminal_status": "completed",
+            }
+            return BrowserTaskResult(
+                success=True,
+                status="completed",
+                summary="完成",
+                steps=2,
+                session_state="kept",
+            )
+
+    plugin._runtime = ProgressRuntime()
+
+    async def fake_finish(self: BrowserSkillPlugin, **kwargs: Any) -> dict[str, Any]:
+        return kwargs
+
+    plugin.finish = MethodType(fake_finish, plugin)
+    await plugin.run_browser_task(
+        instruction="读取当前页面",
+        _ctx={
+            "lanlan_name": "然然",
+            "latest_user_request": "读取当前页面",
+            "invocation_source": "main_llm_tool",
+        },
+    )
+
+    hud = [message for message in plugin.pushed if message["source"].endswith(".hud")]
+    hidden = [
+        message for message in plugin.pushed if message["source"] == "browser_skill.live_status"
+    ]
+    assert [message["parts"][0]["text"] for message in hud] == [
+        "浏览器任务：正在点击页面控件 · 已执行 2 个动作",
+        "浏览器任务：已完成",
+    ]
+    assert all(message["visibility"] == ["hud"] for message in hud)
+    assert all(message["ai_behavior"] == "blind" for message in hud)
+    assert all("private page body" not in message["parts"][0]["text"] for message in hud)
+    assert hidden and all(message["visibility"] == [] for message in hidden)
+
+
+@pytest.mark.asyncio
 async def test_native_tool_preserves_explicit_tab_count_outside_instruction_summary() -> None:
     plugin = _plugin()
     release = asyncio.Event()
@@ -254,6 +328,8 @@ async def test_recoverable_terminal_result_tells_main_llm_to_retry_without_askin
 
     text = plugin.pushed[0]["parts"][0]["text"]
     assert "Immediately call run_browser_task once" in text
+    assert "preserving the same exact target and outcome" in text
+    assert "Do not broaden or replace an explicitly chosen site" in text
     assert "Do not ask the user merely" in text
 
 

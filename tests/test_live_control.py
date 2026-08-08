@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from plugin.plugins.browser_skill import _browser_session_key, _live_status_payload
+from plugin.plugins.browser_skill import (
+    _browser_session_key,
+    _hud_live_status_text,
+    _live_status_payload,
+)
 from plugin.plugins.browser_skill.runtime.control import BrowserTaskController
 from plugin.plugins.browser_skill.runtime.models import BrowserTaskResult
 from plugin.sdk.shared.core.push_message_schema import translate_push_message
@@ -103,6 +107,35 @@ def test_live_context_uses_passive_hidden_coalesced_push_message() -> None:
     assert wire["ai_behavior"] == "read"
     assert wire["coalesce_key"] == "browser_skill.live_status:abc123"
     assert wire["parts"] == [{"type": "text", "text": "safe status"}]
+
+
+def test_hud_progress_is_short_visible_and_blind() -> None:
+    text = _hud_live_status_text(
+        {
+            "active": True,
+            "stage": "acting",
+            "step": 3,
+            "current_action": "click",
+            "message": "untrusted verbose message",
+            "page": {"text": "secret page body"},
+        }
+    )
+    assert text == "浏览器任务：正在点击页面控件 · 已执行 3 个动作"
+    assert "untrusted" not in text and "secret" not in text
+    assert _hud_live_status_text(
+        {"stage": "waiting_for_user", "terminal_status": "needs_user", "step": 12}
+    ) == "浏览器任务：需要用户继续处理"
+
+    wire = translate_push_message(
+        source="browser_skill.live_status.hud",
+        visibility=["hud"],
+        ai_behavior="blind",
+        parts=[{"type": "text", "text": text}],
+        coalesce_key="browser_skill.live_status.hud:abc123",
+    )
+    assert wire["visibility"] == ["hud"]
+    assert wire["ai_behavior"] == "blind"
+    assert wire["coalesce_key"] == "browser_skill.live_status.hud:abc123"
 
 
 def test_session_key_falls_back_to_stable_lanlan_scope() -> None:
