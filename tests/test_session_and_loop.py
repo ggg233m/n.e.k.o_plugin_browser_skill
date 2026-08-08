@@ -596,6 +596,96 @@ async def test_content_entry_done_requires_current_viewport_evidence() -> None:
 
 
 @pytest.mark.asyncio
+async def test_repeated_done_on_stable_navigated_content_finishes_instead_of_looping() -> None:
+    client = FakeBsk()
+
+    async def content_snapshot(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        client.snapshot_token_limits.append(int(kwargs.get("max_tokens") or 0))
+        return {
+            "text": (
+                "heading 111；维基百科，自由的百科全书；"
+                "111（一百一十一）是 110 与 112 之间的自然数。"
+                "数学：第81个合数，正因数有1、3、37和111。"
+            ),
+            "tab_id": 11,
+        }
+
+    async def content_observe(_session_id: str, **_kwargs: Any) -> dict[str, Any]:
+        client.observe_count += 1
+        return {
+            "text": (
+                "维基百科条目 111。一百一十一位于110和112之间；"
+                "当前页面还显示数学、命名和识别等正文栏目。"
+            )
+        }
+
+    client.snapshot = content_snapshot  # type: ignore[method-assign]
+    client.observe = content_observe  # type: ignore[method-assign]
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        NavigateAction(action="navigate", url="https://zh.wikipedia.org/wiki/111"),
+        DoneAction(
+            action="done",
+            summary="已进入维基百科 111 条目",
+            primary_content_visible=True,
+            visible_evidence="页面已经展示111条目的数学和命名正文",
+        ),
+        DoneAction(
+            action="done",
+            summary="已进入维基百科 111 条目并看到正文",
+            primary_content_visible=True,
+            visible_evidence="当前是111的百科正文页面",
+        ),
+        autofill_verified_done=False,
+    )
+
+    result = await make_loop(client, sessions).run(
+        instruction="搜索 111 然后打开维基百科条目",
+        raw_request="搜索 111 然后打开维基百科条目",
+        session=session,
+        planner=planner,
+    )
+
+    assert result.success is True
+    assert result.steps == 3
+    assert len(planner.observations) == 3
+    assert client.observe_count == 1
+
+
+@pytest.mark.asyncio
+async def test_third_consecutive_unverifiable_done_is_fused() -> None:
+    client = FakeBsk()
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        DoneAction(action="done", summary="第一次完成声明"),
+        DoneAction(action="done", summary="第二次完成声明"),
+        DoneAction(action="done", summary="第三次完成声明"),
+        autofill_verified_done=False,
+    )
+
+    with pytest.raises(LoopFailure) as caught:
+        await make_loop(client, sessions).run(
+            instruction="搜索目标文章并点进去",
+            raw_request="搜索目标文章并点进去",
+            session=session,
+            planner=planner,
+        )
+
+    assert caught.value.code == "ACTION_REJECTED"
+    assert caught.value.status == "needs_user"
+    assert len(planner.observations) == 3
+
+
+def test_visible_evidence_matching_ignores_punctuation_and_width() -> None:
+    observation = "111（一百一十一）是 110 与 112 之间的自然数。"
+    evidence = "111 (一百一十一) 是110与112之间的自然数"
+
+    assert AgentLoop._evidence_is_visible(evidence, observation, minimum_chars=8)
+
+
+@pytest.mark.asyncio
 async def test_strong_first_done_finishes_without_second_llm_call() -> None:
     client = FakeBsk()
 
@@ -666,6 +756,161 @@ async def test_search_fill_can_submit_with_enter_in_one_agent_action() -> None:
     assert result.success is True
     assert client.fills == [("@e12", "可爱小猫视频")]
     assert client.pressed == [("Enter", None)]
+
+
+@pytest.mark.asyncio
+async def test_search_only_goal_finishes_as_soon_as_result_url_is_confirmed() -> None:
+    client = FakeBsk()
+    client.url = "https://www.bing.com/"
+
+    async def search_snapshot(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        client.snapshot_token_limits.append(int(kwargs.get("max_tokens") or 0))
+        text = (
+            'textbox "搜索" @e12'
+            if "search?" not in client.url
+            else 'textbox "搜索" value="111" @e4; link "111 - 搜索结果" @e9'
+        )
+        return {"text": text, "tab_id": 11}
+
+    async def submit_search(
+        _session_id: str,
+        key: str,
+        *,
+        target: str | None = None,
+    ) -> dict[str, Any]:
+        client.pressed.append((key, target))
+        client.url = "https://www.bing.com/search?q=111&form=QBRE"
+        return {}
+
+    client.snapshot = search_snapshot  # type: ignore[method-assign]
+    client.press = submit_search  # type: ignore[method-assign]
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        FillAction(action="fill", target="@e12", value="111", submit=True),
+    )
+
+    result = await make_loop(client, sessions).run(
+        instruction="按照用户要求使用 Bing 搜索 111",
+        raw_request="用 Bing 搜索 111",
+        session=session,
+        planner=planner,
+    )
+
+    assert result.success is True
+    assert result.steps == 1
+    assert result.current_url == "https://www.bing.com/search?q=111&form=QBRE"
+    assert len(planner.observations) == 1
+    assert client.fills == [("@e12", "111")]
+    assert client.pressed == [("Enter", None)]
+
+
+@pytest.mark.asyncio
+async def test_compound_search_goal_does_not_finish_after_search_submission() -> None:
+    client = FakeBsk()
+    client.url = "https://www.bing.com/"
+
+    async def search_snapshot(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        text = (
+            'textbox "搜索" @e12'
+            if "search?" not in client.url
+            else 'textbox "搜索" value="猫娘计划" @e4; link "GitHub" @e9'
+        )
+        return {"text": text, "tab_id": 11}
+
+    async def submit_search(
+        _session_id: str,
+        key: str,
+        *,
+        target: str | None = None,
+    ) -> dict[str, Any]:
+        client.pressed.append((key, target))
+        client.url = "https://www.bing.com/search?q=%E7%8C%AB%E5%A8%98%E8%AE%A1%E5%88%92"
+        return {}
+
+    client.snapshot = search_snapshot  # type: ignore[method-assign]
+    client.press = submit_search  # type: ignore[method-assign]
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        FillAction(action="fill", target="@e12", value="猫娘计划", submit=True),
+    )
+    settings = RuntimeSettings(max_steps=1, session_keepalive_seconds=0)
+
+    result = await make_loop(client, sessions, settings).run(
+        instruction="搜索猫娘计划然后打开 GitHub 仓库",
+        raw_request="搜索猫娘计划然后打开 GitHub 仓库",
+        session=session,
+        planner=planner,
+    )
+
+    assert result.success is False
+    assert result.error is not None and result.error.code == "STEP_LIMIT"
+    assert result.steps == 1
+
+
+def test_observation_hash_ignores_volatile_query_args_and_element_refs() -> None:
+    first = (
+        "Current URL: https://www.bing.com/search?q=111&form=QBRE&cvid=one\n"
+        'textbox "搜索" value="111" @e4; link "结果" @e9'
+    )
+    second = (
+        "Current URL: https://www.bing.com/search?q=111&form=ANSPH1&cvid=two\n"
+        'textbox "搜索" value="111" @e17; link "结果" @e28'
+    )
+    changed = (
+        "Current URL: https://www.bing.com/search?q=222\n"
+        'textbox "搜索" value="222" @e4; link "其他结果" @e9'
+    )
+
+    assert AgentLoop._observation_hash(first) == AgentLoop._observation_hash(second)
+    assert AgentLoop._observation_hash(first) != AgentLoop._observation_hash(changed)
+
+
+def test_fill_action_signature_ignores_renumbered_snapshot_ref() -> None:
+    first = FillAction(action="fill", target="@e4", value="111", submit=True)
+    second = FillAction(action="fill", target="@e17", value="111", submit=True)
+    different = FillAction(action="fill", target="@e17", value="222", submit=True)
+
+    assert AgentLoop._action_signature(first) == AgentLoop._action_signature(second)
+    assert AgentLoop._action_signature(first) != AgentLoop._action_signature(different)
+
+
+@pytest.mark.asyncio
+async def test_semantically_unchanged_mutations_stop_after_one_observation_recovery() -> None:
+    client = FakeBsk()
+
+    async def unchanged_search_snapshot(
+        _session_id: str,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        client.snapshot_counter += 1
+        return {
+            "text": f'textbox "搜索" @e{client.snapshot_counter}',
+            "tab_id": 11,
+        }
+
+    client.snapshot = unchanged_search_snapshot  # type: ignore[method-assign]
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        FillAction(action="fill", target="@e1", value="第一次", submit=True),
+        FillAction(action="fill", target="@e2", value="第二次", submit=True),
+        FillAction(action="fill", target="@e12", value="第三次", submit=True),
+    )
+
+    with pytest.raises(LoopFailure) as caught:
+        await make_loop(client, sessions).run(
+            instruction="搜索候选项，然后打开其中一个结果",
+            raw_request="搜索候选项，然后打开其中一个结果",
+            session=session,
+            planner=planner,
+        )
+
+    assert caught.value.code == "ACTION_REJECTED"
+    assert caught.value.status == "needs_user", str(caught.value)
+    assert len(client.fills) == 3
+    assert client.observe_count == 1
 
 
 @pytest.mark.asyncio
