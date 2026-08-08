@@ -126,10 +126,25 @@ class ReloadAction(BaseAction):
 
 class SnapshotAction(BaseAction):
     action: Literal["snapshot"]
+    reason: str = Field(
+        default="",
+        max_length=800,
+        description=(
+            "Refresh the compact page snapshot. Use observe instead when the compact view "
+            "does not contain enough semantic page detail."
+        ),
+    )
 
 
 class ObserveAction(BaseAction):
     action: Literal["observe"]
+    reason: str = Field(
+        default="",
+        max_length=800,
+        description=(
+            "Request a deeper semantic observation after snapshot when more detail is needed."
+        ),
+    )
 
 
 class GetHtmlAction(BaseAction):
@@ -258,7 +273,17 @@ class DoneAction(BaseAction):
         default="",
         max_length=1000,
         description=(
-            "A short exact quote copied from the latest viewport observation that proves completion."
+            "A short contiguous exact quote copied character-for-character from the latest "
+            "viewport observation. Never paraphrase it."
+        ),
+    )
+    visible_evidence_ref: str = Field(
+        default="",
+        max_length=32,
+        pattern=r"^$|^@e\d+$",
+        description=(
+            "An optional exact @eN element ref copied from the latest observation that grounds "
+            "the completion claim. Use it when a stable final element is better evidence than text."
         ),
     )
     session_disposition: SessionDisposition = Field(

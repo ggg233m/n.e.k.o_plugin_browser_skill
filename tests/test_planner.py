@@ -107,4 +107,6 @@ async def test_structured_output_capability_fallback_is_cached_by_endpoint(
     payload = json.loads(created[0].messages[0][1]["content"])
     assert payload["execution_goal"] == "Open Example and read only the main heading"
     assert payload["latest_user_request"] == "Please open Example"
+    assert "without paraphrasing" in payload["completion_evidence_contract"]
+    assert "visible_evidence_ref" in payload["completion_evidence_contract"]
     assert "original_user_request" not in payload

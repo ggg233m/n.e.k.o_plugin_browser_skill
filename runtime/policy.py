@@ -59,9 +59,10 @@ _SEARCH_FIELD_PATTERNS = (
 
 
 class PolicyViolation(ValueError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, replan_hint: str = "") -> None:
         super().__init__(message)
         self.code = code
+        self.replan_hint = str(replan_hint or "").strip()
 
 
 def validate_http_url(url: str) -> str:

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
-from urllib.parse import parse_qs, urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from utils.llm_client import create_chat_llm_async
 from utils.token_tracker import set_call_type
@@ -67,6 +67,8 @@ from .session_manager import ChatBrowserSession, SessionManager
 
 ProgressCallback = Callable[..., Awaitable[None]]
 
+_COMPACT_SNAPSHOT_TOKEN_CAP = 4000
+
 _RECOVERABLE_ELEMENT_FAILURE = re.compile(
     r"(?i)(element|selector|search\s*box|input|ref(?:erence)?|not\s+found|"
     r"link|click|interact|dom|not\s+(?:visible|clickable)|detached|"
@@ -82,32 +84,6 @@ _CONTENT_ENTRY_INTENT = re.compile(
     r"(?:正文|文章|帖子|文档|项目|仓库|页面|结果|content|article|post|document|docs?|"
     r"project|repository|repo|result)"
     r")"
-)
-
-_SEARCH_INTENT = re.compile(
-    r"(?is)(?:\u641c\u7d22|\u641c\u4e00\u4e0b|\u68c0\u7d22|\u67e5\u627e|\u67e5\u8be2|\bsearch\b|\blook\s*up\b)"
-)
-_SEARCH_FOLLOWUP_INTENT = re.compile(
-    r"(?is)(?:\u7136\u540e|\u63a5\u7740|\u968f\u540e|\u4e4b\u540e|\u5e76\u4e14|\u5e76|\u518d|and\s+then|then).{0,160}"
-    r"(?:\u6253\u5f00|\u8fdb\u5165|\u70b9(?:\u51fb)?|\u64ad\u653e|\u9605\u8bfb|\u603b\u7ed3|\u63d0\u53d6|\u4e0b\u8f7d|\u586b\u5199|\u767b\u5f55|"
-    r"\u53d1\u9001|\u63d0\u4ea4|\u8d2d\u4e70|\u6d4b\u8bd5|open|enter|click|play|read|summari[sz]e|"
-    r"extract|download|fill|log\s*in|send|submit|buy|test)"
-)
-_SEARCH_QUERY_KEYS = frozenset(
-    {
-        "q",
-        "query",
-        "querytext",
-        "wd",
-        "word",
-        "keyword",
-        "keywords",
-        "search_query",
-        "searchquery",
-        "searchterm",
-        "text",
-        "s",
-    }
 )
 
 _QR_AUTH_CHALLENGE = re.compile(
@@ -504,6 +480,13 @@ class LLMPlanner:
             "execution_goal": instruction,
             "latest_user_request": raw_request or instruction,
             "verification_required": verification_required,
+            "completion_evidence_contract": (
+                "If action=done, copy visible_evidence as one contiguous exact substring from "
+                "latest_observation without paraphrasing, or copy a relevant current @eN into "
+                "visible_evidence_ref. Check the chosen quote/ref is literally present before "
+                "returning done. The runtime refreshes the page and accepts the first done when "
+                "that grounding remains visible."
+            ),
             "recent_actions": history[-12:],
             "latest_observation": observation[:36000],
         }
@@ -751,7 +734,7 @@ class AgentLoop:
         completion_rejection_count = 0
         completion_rejection_hash = ""
         completion_rejection_url = ""
-        meaningful_navigation_observed = False
+        replannable_policy_rejections = 0
         verification_required = False
         steps = 0
         finalized = False
@@ -765,7 +748,8 @@ class AgentLoop:
             nonlocal repeated_plan_count, last_plan_signature, last_plan_observation_hash
             nonlocal last_mutation_state_hash, stagnation_recovery_used
             nonlocal completion_rejection_count, completion_rejection_hash
-            nonlocal completion_rejection_url, meaningful_navigation_observed
+            nonlocal completion_rejection_url
+            nonlocal replannable_policy_rejections
             if control is None:
                 return False
             updates = control.consume_updates()
@@ -810,7 +794,7 @@ class AgentLoop:
             completion_rejection_count = 0
             completion_rejection_hash = ""
             completion_rejection_url = ""
-            meaningful_navigation_observed = False
+            replannable_policy_rejections = 0
             await self._progress(progress, "steering", "已接收新要求，正在重新观察和规划", steps)
             tabs = await self.client.tab_list(session.bsk_session_id, scope="agent")
             refreshed_url, refreshed_tab_id = self._active_tab_state(tabs)
@@ -854,7 +838,7 @@ class AgentLoop:
             nonlocal completion_rejection_count, completion_rejection_hash
             nonlocal completion_rejection_url
             current_hash = self._observation_hash(observation)
-            current_url_key = self._stable_url_key(current_url)
+            current_url_key = self._page_route_key(current_url)
             stable_page = bool(
                 completion_rejection_count
                 and current_hash == completion_rejection_hash
@@ -1093,34 +1077,13 @@ class AgentLoop:
                             continue
                     if self._requires_primary_content_view(instruction, raw_request):
                         missing_visible_body = not action.primary_content_visible
-                        invalid_evidence = not self._evidence_is_visible(
-                            action.visible_evidence,
+                        invalid_evidence = not self._completion_evidence_is_visible(
+                            action,
                             observation,
-                            minimum_chars=3,
                         )
                         if missing_visible_body or invalid_evidence:
-                            rejected_done_count, stable_rejected_page = (
-                                record_completion_rejection()
-                            )
-                            accept_stable_completion = bool(
-                                not missing_visible_body
-                                and stable_rejected_page
-                                and self._stable_repeated_done_is_acceptable(
-                                    current_url=current_url,
-                                    observation=observation,
-                                    meaningful_navigation_observed=(
-                                        meaningful_navigation_observed
-                                    ),
-                                )
-                            )
-                            if accept_stable_completion:
-                                if self.logger is not None and self.settings.debug_logging:
-                                    self.logger.debug(
-                                        "BrowserSkill completion accepted step={} path=stable_repeated_done rejected_count={}",
-                                        steps,
-                                        rejected_done_count,
-                                    )
-                            elif rejected_done_count >= 3:
+                            rejected_done_count, _ = record_completion_rejection()
+                            if rejected_done_count >= 3:
                                 raise LoopFailure(
                                     "ACTION_REJECTED",
                                     "Agent 连续声明完成，但没有提供可验证的当前页面证据",
@@ -1131,45 +1094,43 @@ class AgentLoop:
                                     retryable=True,
                                     status="needs_user",
                                 )
-                            if accept_stable_completion:
-                                pass
-                            else:
-                                await self._progress(
-                                    progress,
-                                    "planning" if missing_visible_body else "observing",
-                                    (
-                                        "正文尚未确认，等待 Agent 根据页面位置决定是否滚动"
-                                        if missing_visible_body
-                                        else "正在校正当前视口的完成证据"
-                                    ),
+                            await self._progress(
+                                progress,
+                                "planning" if missing_visible_body else "observing",
+                                (
+                                    "正文尚未确认，等待 Agent 根据页面位置决定是否滚动"
+                                    if missing_visible_body
+                                    else "正在校正当前视口的完成证据"
+                                ),
+                                steps,
+                            )
+                            if self.logger is not None and self.settings.debug_logging:
+                                self.logger.debug(
+                                    "BrowserSkill completion rejected step={} reason={} runtime_scrolled={} rejected_count={}",
                                     steps,
-                                )
-                                if self.logger is not None and self.settings.debug_logging:
-                                    self.logger.debug(
-                                        "BrowserSkill completion rejected step={} reason={} runtime_scrolled={} rejected_count={}",
-                                        steps,
-                                        (
-                                            "primary_content_not_visible"
-                                            if missing_visible_body
-                                            else "visible_evidence_mismatch"
-                                        ),
-                                        False,
-                                        rejected_done_count,
-                                    )
-                                history.append(
                                     (
-                                        "Completion lacked confirmed primary content. The runtime did not "
-                                        "scroll. Read the viewport-position header and choose the next action "
-                                        "yourself: scroll moves exactly one viewport, and repeated scroll turns "
-                                        "let you decide the total distance. Do not repeat done without new "
-                                        "evidence or movement. A third consecutive rejected done will be stopped."
+                                        "primary_content_not_visible"
                                         if missing_visible_body
-                                        else "Completion evidence did not match the current observation after "
-                                        "punctuation and whitespace normalization. Copy a short current-page "
-                                        "quote or take a different real action; do not repeat done."
-                                    )
+                                        else "visible_evidence_mismatch"
+                                    ),
+                                    False,
+                                    rejected_done_count,
                                 )
-                                continue
+                            history.append(
+                                (
+                                    "Completion lacked confirmed primary content. The runtime did not "
+                                    "scroll. Read the viewport-position header and choose the next action "
+                                    "yourself: scroll moves exactly one viewport, and repeated scroll turns "
+                                    "let you decide the total distance. Do not repeat done without new "
+                                    "evidence or movement. A third consecutive rejected done will be stopped."
+                                    if missing_visible_body
+                                    else "Completion evidence did not match at least eight current-page "
+                                    "characters after punctuation and whitespace normalization. Copy a short "
+                                    "exact quote from page content, not the URL or runtime headers, or take a "
+                                    "different real action; do not repeat done."
+                                )
+                            )
+                            continue
                     disposition = (
                         "close_session"
                         if final_session_action == "close"
@@ -1192,8 +1153,6 @@ class AgentLoop:
                         session_state=session_state,
                         session_decision_required=decision_required,
                     )
-
-                reset_completion_rejections()
 
                 if isinstance(action, TabCreateAction):
                     challenge = self._human_auth_challenge(observation)
@@ -1306,6 +1265,8 @@ class AgentLoop:
                 verification_required = False
                 before_hash = self._observation_hash(observation)
                 previous_url = current_url
+                previous_tab_id = session.current_tab_id
+                action_effect_confirmed = False
                 await self._progress(progress, "acting", self._safe_action_message(action), steps)
                 try:
                     result_text, result_url, explicit_observation, level = await self._execute_action(
@@ -1392,6 +1353,32 @@ class AgentLoop:
                         ) + "Agent 已完成观察升级和一次替代路径尝试。"
                     raise mapped from exc
                 except PolicyViolation as exc:
+                    if exc.replan_hint:
+                        replannable_policy_rejections += 1
+                        if replannable_policy_rejections >= 3:
+                            raise LoopFailure(
+                                "ACTION_REJECTED",
+                                "Agent 连续选择了不适用于当前输入框的组合提交动作",
+                                hint=(
+                                    "当前页面未被修改；已停止重复规划。继续时请拆分填写与发送动作。"
+                                ),
+                                retryable=True,
+                                status="needs_user",
+                            ) from exc
+                        history.append(
+                            "The proposed action was safely rejected before the page changed. "
+                            f"{exc.replan_hint} Re-plan from the current observation; do not fail "
+                            "the task or ask the user merely because this combined action was invalid."
+                        )
+                        if self.logger is not None and self.settings.debug_logging:
+                            self.logger.debug(
+                                "BrowserSkill replannable policy rejection step={} action={} count={} code={}",
+                                steps,
+                                action.action,
+                                replannable_policy_rejections,
+                                exc.code,
+                            )
+                        continue
                     raise LoopFailure(exc.code, str(exc)) from exc
 
                 if (
@@ -1410,9 +1397,18 @@ class AgentLoop:
                 elif not isinstance(action, SnapshotAction):
                     satisfied_tab_create_count = 0
 
+                if session.current_tab_id != previous_tab_id:
+                    action_effect_confirmed = True
                 if result_url:
-                    if self._stable_url_key(result_url) != self._stable_url_key(previous_url):
-                        meaningful_navigation_observed = True
+                    action_effect_confirmed = bool(
+                        action_effect_confirmed
+                        or self._action_url_effect_confirmed(
+                            action,
+                            previous_url=previous_url,
+                            current_url=result_url,
+                            direct_result=True,
+                        )
+                    )
                     current_url = result_url
                     session.current_url = result_url
                     if control is not None:
@@ -1430,15 +1426,22 @@ class AgentLoop:
                         refreshed_url, refreshed_tab_id = self._active_tab_state(refreshed_tabs)
                         refreshed_title = self._active_tab_title(refreshed_tabs)
                         if refreshed_url:
-                            if self._stable_url_key(refreshed_url) != self._stable_url_key(
-                                previous_url
-                            ):
-                                meaningful_navigation_observed = True
+                            action_effect_confirmed = bool(
+                                action_effect_confirmed
+                                or self._action_url_effect_confirmed(
+                                    action,
+                                    previous_url=previous_url,
+                                    current_url=refreshed_url,
+                                    direct_result=False,
+                                )
+                            )
                             current_url = refreshed_url
                             session.current_url = refreshed_url
                             if control is not None:
                                 control.update_url(current_url)
                         if refreshed_tab_id is not None:
+                            if refreshed_tab_id != previous_tab_id:
+                                action_effect_confirmed = True
                             session.current_tab_id = refreshed_tab_id
                         if refreshed_title:
                             session.current_title = refreshed_title
@@ -1487,56 +1490,21 @@ class AgentLoop:
                         last_mutation_state_hash
                         and post_action_hash == last_mutation_state_hash
                     )
-                    if post_action_hash == before_hash or same_as_previous_mutation:
-                        no_progress += 1
-                    else:
+                    made_progress = bool(
+                        action_effect_confirmed
+                        or (
+                            post_action_hash != before_hash
+                            and not same_as_previous_mutation
+                        )
+                    )
+                    if made_progress:
                         no_progress = 0
+                        stagnation_recovery_used = False
+                        replannable_policy_rejections = 0
+                        reset_completion_rejections()
+                    else:
+                        no_progress += 1
                     last_mutation_state_hash = post_action_hash
-
-                    if (
-                        isinstance(action, FillAction)
-                        and action.submit
-                        and self._is_search_only_goal(instruction, raw_request)
-                        and self._is_confirmed_search_result(
-                            action,
-                            current_url=current_url,
-                            observation=observation,
-                        )
-                    ):
-                        disposition = (
-                            "close_session"
-                            if final_session_action == "close"
-                            else "keep_session"
-                        )
-                        if not session.reusable:
-                            disposition = "close_session"
-                        session_state = await self._finalize_session(session, disposition)
-                        decision_required = (
-                            final_session_action == "defer" and session_state == "kept"
-                        )
-                        finalized = True
-                        return BrowserTaskResult(
-                            success=True,
-                            status="completed",
-                            summary=(
-                                "已完成搜索并显示结果"
-                                if language == "zh"
-                                else "Search completed and results are displayed"
-                            ),
-                            details=(
-                                "搜索结果页已加载；浏览器会话已保留，可继续操作。"
-                                if language == "zh" and session_state == "kept"
-                                else (
-                                    "搜索结果页已加载。"
-                                    if language == "zh"
-                                    else "The search results page has loaded."
-                                )
-                            ),
-                            current_url=current_url,
-                            steps=steps,
-                            session_state=session_state,
-                            session_decision_required=decision_required,
-                        )
 
                     if stagnation_recovery_used and no_progress >= 1:
                         raise LoopFailure(
@@ -1589,8 +1557,11 @@ class AgentLoop:
                         history.append(
                             "Two actions produced no visible progress. Technical recovery is automatic: "
                             "use the new observation and choose a structurally different safe action, or done "
-                            "if the visible page already satisfies the goal. Do not repeat the same fill/submit "
-                            "or ask the user. One more unchanged mutation will be stopped by the runtime."
+                            "if the visible page already satisfies the goal. Do not click the same recovery "
+                            "control again, repeat the same fill/submit, or ask the user merely to retry. If the "
+                            "same visible failure remains after this deep observation, choose one genuinely "
+                            "different safe route or fail with that page evidence. One more unchanged mutation "
+                            "will be stopped by the runtime."
                         )
                         no_progress = 0
                         stagnation_recovery_used = True
@@ -1669,12 +1640,18 @@ class AgentLoop:
     ) -> tuple[str, str, str | None, int]:
         sid = session.bsk_session_id
         if isinstance(action, SnapshotAction):
+            max_tokens = self._compact_snapshot_token_limit()
             payload = await self.client.snapshot(
                 sid,
                 max_depth=self.settings.snapshot_max_depth,
-                max_tokens=self.settings.snapshot_max_tokens,
+                max_tokens=max_tokens,
             )
-            return "Captured a fresh snapshot.", "", str(payload.get("text") or ""), 1
+            observation = self._compact_snapshot_observation(
+                str(payload.get("text") or ""),
+                max_tokens=max_tokens,
+                truncated=bool(payload.get("truncated")),
+            )
+            return "Captured a fresh compact snapshot.", "", observation, 1
         if isinstance(action, ObserveAction):
             if observation_level < 1:
                 raise PolicyViolation("ACTION_REJECTED", "observe 前必须先 snapshot")
@@ -1737,6 +1714,11 @@ class AgentLoop:
                 raise PolicyViolation(
                     "ACTION_REJECTED",
                     "fill.submit 仅允许用于当前观察中明确标记的普通搜索框",
+                    replan_hint=(
+                        "fill.submit is only a search-box shortcut. Use fill with submit=false for "
+                        "this field, then choose a separate press or click action if submission is "
+                        "still required so the runtime can apply the normal confirmation policy."
+                    ),
                 )
             await self._retry_browser(lambda: self.client.fill(sid, action.target, action.value))
             if action.submit:
@@ -2304,21 +2286,46 @@ class AgentLoop:
         return title, prompt
 
     async def _snapshot(self, session: ChatBrowserSession, current_url: str) -> str:
+        max_tokens = self._compact_snapshot_token_limit()
         payload = await self.client.snapshot(
             session.bsk_session_id,
             max_depth=self.settings.snapshot_max_depth,
-            max_tokens=self.settings.snapshot_max_tokens,
+            max_tokens=max_tokens,
         )
         tab_id = self._int_or_none(payload.get("tab_id"))
         if tab_id is not None:
             session.current_tab_id = tab_id
-        text = str(payload.get("text") or "(empty snapshot — page may still be loading)")
-        if payload.get("truncated"):
-            text += "\n[Snapshot truncated by configured token/depth limit]"
+        raw_text = str(payload.get("text") or "(empty snapshot — page may still be loading)")
+        text = self._compact_snapshot_observation(
+            raw_text,
+            max_tokens=max_tokens,
+            truncated=bool(payload.get("truncated")),
+        )
         session.current_url = current_url or session.current_url
-        session.last_observation = text
+        # Keep the undecorated browser state for scroll/no-progress comparisons;
+        # the compact-mode header is planner guidance, not page content.
+        session.last_observation = raw_text
         session.last_observation_at = time.time()
         return self._with_url(text, current_url)
+
+    def _compact_snapshot_token_limit(self) -> int:
+        return min(self.settings.snapshot_max_tokens, _COMPACT_SNAPSHOT_TOKEN_CAP)
+
+    @staticmethod
+    def _compact_snapshot_observation(
+        text: str,
+        *,
+        max_tokens: int,
+        truncated: bool,
+    ) -> str:
+        header = (
+            f"[Runtime observation mode: compact snapshot, max_tokens={max_tokens}; "
+            "choose observe only when deeper semantic page detail is needed.]"
+        )
+        body = str(text or "")
+        if truncated:
+            body += "\n[Snapshot truncated by compact token/depth limit; observe can expand it.]"
+        return f"{header}\n{body}"
 
     async def _completion_observation(
         self,
@@ -2369,22 +2376,17 @@ class AgentLoop:
         re-planning path, so this optimization never guesses completion from a
         summary or URL alone.
         """
-        evidence = AgentLoop._normalize_visible_text(action.visible_evidence)
-        if len(evidence) < 8:
+        has_text_evidence = len(
+            AgentLoop._normalize_visible_text(action.visible_evidence)
+        ) >= 8
+        has_ref_evidence = bool(re.fullmatch(r"@e\d+", action.visible_evidence_ref.strip()))
+        if not has_text_evidence and not has_ref_evidence:
             return "visible_evidence_missing_or_too_short"
         if primary_content_required and not action.primary_content_visible:
             return "primary_content_not_visible"
-        if not AgentLoop._evidence_is_visible(
-            action.visible_evidence,
-            previous_observation,
-            minimum_chars=8,
-        ):
+        if not AgentLoop._completion_evidence_is_visible(action, previous_observation):
             return "evidence_not_in_latest_viewport"
-        if not AgentLoop._evidence_is_visible(
-            action.visible_evidence,
-            completion_observation,
-            minimum_chars=8,
-        ):
+        if not AgentLoop._completion_evidence_is_visible(action, completion_observation):
             return "evidence_not_stable_after_refresh"
         return None
 
@@ -2392,6 +2394,27 @@ class AgentLoop:
     def _normalize_visible_text(value: str) -> str:
         normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
         return "".join(char for char in normalized if char.isalnum())
+
+    @staticmethod
+    def _page_observation_text(observation: str) -> str:
+        """Remove runtime-owned headers before matching page evidence."""
+        page_lines: list[str] = []
+        for line in str(observation or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Current URL: "):
+                continue
+            if stripped.startswith(
+                (
+                    "[Completion semantic observation:",
+                    "[Completion semantic observation unavailable:",
+                    "[Runtime observation mode:",
+                    "[Runtime viewport position;",
+                    "[Snapshot truncated by compact token/depth limit;",
+                )
+            ):
+                continue
+            page_lines.append(line)
+        return "\n".join(page_lines)
 
     @classmethod
     def _evidence_is_visible(
@@ -2404,65 +2427,100 @@ class AgentLoop:
         normalized_evidence = cls._normalize_visible_text(evidence)
         if len(normalized_evidence) < minimum_chars:
             return False
-        return normalized_evidence in cls._normalize_visible_text(observation)
+        page_text = cls._page_observation_text(observation)
+        return normalized_evidence in cls._normalize_visible_text(page_text)
+
+    @classmethod
+    def _evidence_ref_is_visible(cls, evidence_ref: str, observation: str) -> bool:
+        ref = str(evidence_ref or "").strip()
+        if not re.fullmatch(r"@e\d+", ref):
+            return False
+        page_text = cls._page_observation_text(observation)
+        return re.search(rf"(?<![\w@]){re.escape(ref)}(?!\d)", page_text) is not None
+
+    @classmethod
+    def _completion_evidence_is_visible(
+        cls,
+        action: DoneAction,
+        observation: str,
+    ) -> bool:
+        return cls._evidence_is_visible(
+            action.visible_evidence,
+            observation,
+            minimum_chars=8,
+        ) or cls._evidence_ref_is_visible(action.visible_evidence_ref, observation)
 
     @staticmethod
-    def _stable_url_key(url: str) -> str:
+    def _page_route_key(url: str) -> str:
+        """Return URL structure without guessing query-parameter semantics."""
         try:
             parsed = urlsplit(str(url or ""))
             if not parsed.scheme or not parsed.hostname:
-                return str(url or "").strip().casefold()
+                raw = str(url or "").strip()
+                return raw.split("#", 1)[0].split("?", 1)[0].casefold()
             port = f":{parsed.port}" if parsed.port else ""
-            return (
+            route = (
                 f"{parsed.scheme.casefold()}://{parsed.hostname.casefold()}"
                 f"{port}{parsed.path or '/'}"
             )
+            fragment = parsed.fragment
+            fragment_path = fragment.partition("?")[0]
+            # Hash-router paths identify a different page route; ordinary
+            # in-page anchors and hash query metadata do not.
+            if fragment_path.startswith(("/", "!/")):
+                route += f"#{fragment_path}"
+            return route
         except (ValueError, UnicodeError):
-            return str(url or "").strip().casefold()
+            raw = str(url or "").strip()
+            return raw.split("#", 1)[0].split("?", 1)[0].casefold()
 
-    @classmethod
-    def _looks_like_search_results_url(cls, url: str) -> bool:
+    @staticmethod
+    def _full_url_key(url: str) -> str:
+        """Normalize only scheme/authority; preserve every route and query value."""
         try:
-            parsed = urlsplit(str(url or ""))
-        except ValueError:
-            return False
-        if not cls._search_queries_from_url(url):
-            return False
-        route = f"{parsed.path}#{parsed.fragment.split('?', 1)[0]}".casefold()
-        return bool(
-            re.search(r"(?:^|[/#_.-])(?:search|results?|find)(?:$|[/#_.-])", route)
-            or parsed.path.casefold().rstrip("/") in {"/s", "/s/web"}
-        )
+            parsed = urlsplit(str(url or "").strip())
+            if not parsed.scheme or not parsed.netloc:
+                return str(url or "").strip()
+            result = (
+                f"{parsed.scheme.casefold()}://{parsed.netloc.casefold()}"
+                f"{parsed.path or '/'}"
+            )
+            if parsed.query:
+                result += f"?{parsed.query}"
+            if parsed.fragment:
+                result += f"#{parsed.fragment}"
+            return result
+        except (ValueError, UnicodeError):
+            return str(url or "").strip()
 
     @classmethod
-    def _stable_repeated_done_is_acceptable(
+    def _action_url_effect_confirmed(
         cls,
+        action: AgentAction,
         *,
+        previous_url: str,
         current_url: str,
-        observation: str,
-        meaningful_navigation_observed: bool,
+        direct_result: bool,
     ) -> bool:
-        """Accept a second stable done after a real navigation to content.
-
-        This is deliberately narrower than trusting the model: it is used only
-        for content-entry goals, requires primary_content_visible on the action,
-        a non-search HTTP(S) page reached by this task, a substantial stable
-        observation, and no authentication blocker.
-        """
-        if not meaningful_navigation_observed:
+        """Use URL changes only when the action gives them trustworthy context."""
+        if cls._full_url_key(previous_url) == cls._full_url_key(current_url):
             return False
-        try:
-            parsed = urlsplit(current_url)
-        except ValueError:
-            return False
-        if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
-            return False
-        if cls._looks_like_search_results_url(current_url):
-            return False
-        if cls._human_auth_challenge(observation) is not None:
-            return False
-        visible = cls._normalize_visible_text(observation)
-        return len(visible) >= 80 and "emptysnapshot" not in visible
+        if cls._page_route_key(previous_url) != cls._page_route_key(current_url):
+            return True
+        return bool(
+            direct_result
+            and isinstance(
+                action,
+                (
+                    NavigateAction,
+                    NavigateBackAction,
+                    NavigateForwardAction,
+                    ClickAction,
+                    WaitForNavigationAction,
+                    TabCreateAction,
+                ),
+            )
+        )
 
     @staticmethod
     def _requires_primary_content_view(instruction: str, raw_request: str) -> bool:
@@ -2624,13 +2682,15 @@ class AgentLoop:
 
     @staticmethod
     def _action_signature(action: AgentAction) -> str:
-        """Hash an action while ignoring disposable BrowserSkill refs.
+        """Hash executable intent while ignoring model prose and disposable refs.
 
         A fresh snapshot can renumber the same search box from @e4 to @e17.
         Treating those as different actions let an otherwise identical
-        fill+submit plan evade the repetition fuse.
+        fill+submit plan evade the repetition fuse. ``reason`` is explanatory
+        model prose and must not let the same executable action look new.
         """
         payload = action.model_dump(mode="json", exclude_none=True)
+        payload.pop("reason", None)
         if isinstance(action, FillAction):
             target = str(payload.get("target") or "")
             if re.fullmatch(r"@e\d+", target, flags=re.IGNORECASE):
@@ -2664,67 +2724,6 @@ class AgentLoop:
         )
 
     @staticmethod
-    def _is_search_only_goal(instruction: str, raw_request: str) -> bool:
-        goal = " ".join((str(instruction or ""), str(raw_request or ""))).strip()
-        if not _SEARCH_INTENT.search(goal):
-            return False
-        if _CONTENT_ENTRY_INTENT.search(goal) or _SEARCH_FOLLOWUP_INTENT.search(goal):
-            return False
-        if additional_agent_tab_requested(goal):
-            return False
-        return True
-
-    @staticmethod
-    def _search_queries_from_url(url: str) -> list[str]:
-        try:
-            parsed = urlsplit(url)
-        except ValueError:
-            return []
-        query_parts = [parsed.query]
-        if "?" in parsed.fragment:
-            query_parts.append(parsed.fragment.split("?", 1)[1])
-        values: list[str] = []
-        for query_part in query_parts:
-            for key, candidates in parse_qs(query_part, keep_blank_values=False).items():
-                if key.casefold().replace("-", "_") not in _SEARCH_QUERY_KEYS:
-                    continue
-                values.extend(str(candidate) for candidate in candidates if str(candidate).strip())
-        return values
-
-    @classmethod
-    def _is_confirmed_search_result(
-        cls,
-        action: FillAction,
-        *,
-        current_url: str,
-        observation: str,
-    ) -> bool:
-        """Confirm a submitted *search-only* goal from browser state.
-
-        This intentionally requires the submitted query in a normal HTTP(S)
-        result URL.  It is not used for compound goals, sites whose result URL
-        cannot be confirmed, or pages blocked by authentication/CAPTCHA.
-        """
-        try:
-            parsed = urlsplit(current_url)
-        except ValueError:
-            return False
-        if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
-            return False
-        if cls._human_auth_challenge(observation) is not None:
-            return False
-        visible = " ".join(str(observation or "").split()).casefold()
-        if not visible or "empty snapshot" in visible:
-            return False
-        expected = " ".join(action.value.split()).casefold()
-        if not expected:
-            return False
-        return any(
-            " ".join(candidate.split()).casefold() == expected
-            for candidate in cls._search_queries_from_url(current_url)
-        )
-
-    @staticmethod
     def _with_url(observation: str, url: str) -> str:
         header = f"Current URL: {url or '(unknown)'}"
         return f"{header}\n{observation[:40000]}"
@@ -2737,21 +2736,12 @@ class AgentLoop:
 
     @staticmethod
     def _observation_hash(observation: str) -> str:
-        """Hash stable page meaning, excluding volatile URL args and refs."""
-        lines = str(observation or "").splitlines()
-        normalized_lines: list[str] = []
-        for index, line in enumerate(lines):
-            if index == 0 and line.startswith("Current URL: "):
-                raw_url = line[len("Current URL: ") :].strip()
-                try:
-                    parsed = urlsplit(raw_url)
-                    if parsed.scheme and parsed.hostname:
-                        port = f":{parsed.port}" if parsed.port else ""
-                        line = f"Current URL: {parsed.scheme.casefold()}://{parsed.hostname.casefold()}{port}{parsed.path or '/'}"
-                except (ValueError, UnicodeError):
-                    pass
-            normalized_lines.append(line)
-        material = "\n".join(normalized_lines).casefold()
+        """Hash stable page meaning, excluding runtime wrappers, URL args and refs."""
+        current_url = AgentLoop._observation_url(observation)
+        page_text = AgentLoop._page_observation_text(observation)
+        material = (
+            f"Current route: {AgentLoop._page_route_key(current_url)}\n{page_text}"
+        ).casefold()
         material = re.sub(r"@e\d+", "@e#", material)
         material = re.sub(r"\s+", " ", material).strip()
         return hashlib.sha256(material.encode("utf-8", errors="replace")).hexdigest()

@@ -108,6 +108,23 @@ def _live_status_payload(status: dict[str, object]) -> dict[str, object]:
     return {key: status[key] for key in allowed if key in status}
 
 
+def _steer_reply_payload(payload: dict[str, object]) -> dict[str, object]:
+    """Complete the fixed SDK reply contract for every steering outcome."""
+    result = dict(payload)
+    result.setdefault("accepted", False)
+    result.setdefault("active", False)
+    result.setdefault("message", "浏览器任务引导未生效")
+    result.setdefault("stage", "idle")
+    result.setdefault("current_action", "")
+    result.setdefault("goal_revision", 0)
+    result.setdefault("applied_revision", 0)
+    result.setdefault("pending_updates", 0)
+    result.setdefault("update_revision", 0)
+    result.setdefault("can_steer", bool(result.get("active")))
+    result.setdefault("summary", str(result.get("message") or "浏览器任务引导已处理"))
+    return result
+
+
 _MAIN_TOOL_DESCRIPTION = (
     "Use BrowserSkill immediately for every real browser or web task: search, open/read pages, "
     "click, fill forms, use logged-in Chrome/Edge state, play media, or test a website. "
@@ -1409,7 +1426,7 @@ class BrowserSkillPlugin(NekoPluginBase):
             requirement=direction,
             user_request=raw_request,
         )
-        payload.setdefault("summary", str(payload.get("message") or "浏览器任务引导已处理"))
+        payload = _steer_reply_payload(payload)
         return await self.finish(
             data=payload,
             delivery="passive",

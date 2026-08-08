@@ -5,7 +5,7 @@ from types import MethodType, SimpleNamespace
 from typing import Any
 
 import pytest
-from plugin.plugins.browser_skill import BrowserSkillPlugin
+from plugin.plugins.browser_skill import BrowserSkillPlugin, _steer_reply_payload
 from plugin.sdk.plugin.llm_tool import collect_llm_tool_methods
 
 
@@ -120,6 +120,34 @@ def test_success_result_has_empty_recovery_reason_required_by_host_schema() -> N
 
     assert result["recovery_recommended"] is False
     assert result["recovery_reason"] == ""
+
+
+def test_inactive_steering_reply_satisfies_fixed_sdk_contract() -> None:
+    result = _steer_reply_payload(
+        {
+            "accepted": False,
+            "active": False,
+            "message": "当前聊天没有正在执行的 BrowserSkill 任务",
+            "can_steer": False,
+        }
+    )
+
+    required = {
+        "accepted",
+        "active",
+        "message",
+        "stage",
+        "current_action",
+        "goal_revision",
+        "applied_revision",
+        "pending_updates",
+        "update_revision",
+        "can_steer",
+        "summary",
+    }
+    assert required <= result.keys()
+    assert result["stage"] == "idle"
+    assert result["summary"] == "当前聊天没有正在执行的 BrowserSkill 任务"
 
 
 @pytest.mark.asyncio

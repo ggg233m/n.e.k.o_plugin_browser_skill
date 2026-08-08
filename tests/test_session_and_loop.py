@@ -16,6 +16,8 @@ from plugin.plugins.browser_skill.runtime.models import (
     FailAction,
     FillAction,
     NavigateAction,
+    ObserveAction,
+    PressAction,
     RuntimeSettings,
     ScrollAction,
     SnapshotAction,
@@ -79,6 +81,7 @@ class FakeBsk:
         self.selected_tabs: list[int] = []
         self.cancel_count = 0
         self.observe_count = 0
+        self.observe_token_limits: list[int] = []
         self.html_count = 0
         self.pressed: list[tuple[str, str | None]] = []
         self.snapshot_token_limits: list[int] = []
@@ -125,6 +128,7 @@ class FakeBsk:
 
     async def observe(self, session_id: str, **kwargs: Any) -> dict[str, Any]:
         self.observe_count += 1
+        self.observe_token_limits.append(int(kwargs.get("max_tokens") or 0))
         return {"text": 'semantic page; textbox "搜索" @e12; button "百度一下" @e13'}
 
     async def get_html(self, session_id: str, **kwargs: Any) -> dict[str, Any]:
@@ -559,6 +563,36 @@ async def test_scroll_returns_to_llm_after_each_page() -> None:
 
 
 @pytest.mark.asyncio
+async def test_compact_snapshot_escalates_to_full_observe_only_when_agent_requests_it() -> None:
+    client = FakeBsk()
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        ObserveAction(action="observe", reason="紧凑视图里没有足够正文"),
+        DoneAction(
+            action="done",
+            summary="已在深度观察中看到目标",
+            visible_evidence="semantic page",
+        ),
+        autofill_verified_done=False,
+    )
+    settings = RuntimeSettings(snapshot_max_tokens=7000, session_keepalive_seconds=0)
+
+    result = await make_loop(client, sessions, settings).run(
+        instruction="读取页面目标内容",
+        raw_request="读取页面目标内容",
+        session=session,
+        planner=planner,
+    )
+
+    assert result.success is True
+    assert client.snapshot_token_limits[0] == 4000
+    assert client.observe_token_limits == [7000, 7000]
+    assert "Runtime observation mode: compact snapshot" in planner.observations[0]
+    assert "Runtime observation mode: compact snapshot" not in planner.observations[1]
+
+
+@pytest.mark.asyncio
 async def test_content_entry_done_requires_current_viewport_evidence() -> None:
     client = FakeBsk()
     sessions = SessionManager(client)  # type: ignore[arg-type]
@@ -596,7 +630,7 @@ async def test_content_entry_done_requires_current_viewport_evidence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_repeated_done_on_stable_navigated_content_finishes_instead_of_looping() -> None:
+async def test_repeated_done_with_invalid_evidence_is_fused_after_navigation() -> None:
     client = FakeBsk()
 
     async def content_snapshot(_session_id: str, **kwargs: Any) -> dict[str, Any]:
@@ -637,19 +671,26 @@ async def test_repeated_done_on_stable_navigated_content_finishes_instead_of_loo
             primary_content_visible=True,
             visible_evidence="当前是111的百科正文页面",
         ),
+        DoneAction(
+            action="done",
+            summary="再次声明已经看到正文",
+            primary_content_visible=True,
+            visible_evidence="这段证据同样不在当前页面",
+        ),
         autofill_verified_done=False,
     )
 
-    result = await make_loop(client, sessions).run(
-        instruction="搜索 111 然后打开维基百科条目",
-        raw_request="搜索 111 然后打开维基百科条目",
-        session=session,
-        planner=planner,
-    )
+    with pytest.raises(LoopFailure) as caught:
+        await make_loop(client, sessions).run(
+            instruction="搜索 111 然后打开维基百科条目",
+            raw_request="搜索 111 然后打开维基百科条目",
+            session=session,
+            planner=planner,
+        )
 
-    assert result.success is True
-    assert result.steps == 3
-    assert len(planner.observations) == 3
+    assert caught.value.code == "ACTION_REJECTED"
+    assert caught.value.status == "needs_user"
+    assert len(planner.observations) == 4
     assert client.observe_count == 1
 
 
@@ -685,6 +726,46 @@ def test_visible_evidence_matching_ignores_punctuation_and_width() -> None:
     assert AgentLoop._evidence_is_visible(evidence, observation, minimum_chars=8)
 
 
+def test_visible_evidence_does_not_match_runtime_url_header() -> None:
+    observation = (
+        "Current URL: https://zh.wikipedia.org/wiki/111\n"
+        "页面仍在加载，当前还没有正文。"
+    )
+
+    assert not AgentLoop._evidence_is_visible(
+        "wikipediawiki111",
+        observation,
+        minimum_chars=8,
+    )
+
+
+@pytest.mark.asyncio
+async def test_observation_actions_cannot_reset_rejected_done_fuse() -> None:
+    client = FakeBsk()
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        DoneAction(action="done", summary="第一次无证据完成"),
+        SnapshotAction(action="snapshot"),
+        DoneAction(action="done", summary="第二次无证据完成"),
+        ObserveAction(action="observe"),
+        DoneAction(action="done", summary="第三次无证据完成"),
+        autofill_verified_done=False,
+    )
+
+    with pytest.raises(LoopFailure) as caught:
+        await make_loop(client, sessions).run(
+            instruction="搜索目标文章并点进去",
+            raw_request="搜索目标文章并点进去",
+            session=session,
+            planner=planner,
+        )
+
+    assert caught.value.code == "ACTION_REJECTED"
+    assert caught.value.status == "needs_user"
+    assert len(planner.observations) == 5
+
+
 @pytest.mark.asyncio
 async def test_strong_first_done_finishes_without_second_llm_call() -> None:
     client = FakeBsk()
@@ -714,6 +795,45 @@ async def test_strong_first_done_finishes_without_second_llm_call() -> None:
     result = await make_loop(client, sessions).run(
         instruction="搜索目标文章并点进去",
         raw_request="搜索目标文章并点进去",
+        session=session,
+        planner=planner,
+    )
+
+    assert result.success is True
+    assert result.steps == 1
+    assert client.observe_count == 1
+    assert len(planner.observations) == 1
+
+
+@pytest.mark.asyncio
+async def test_stable_element_ref_can_ground_first_done_without_second_llm_call() -> None:
+    client = FakeBsk()
+
+    async def content_snapshot(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        client.snapshot_token_limits.append(int(kwargs.get("max_tokens") or 0))
+        return {"text": 'status "消息已发送" @e77', "tab_id": 11}
+
+    async def content_observe(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        client.observe_count += 1
+        client.observe_token_limits.append(int(kwargs.get("max_tokens") or 0))
+        return {"text": 'status "消息已发送" @e77'}
+
+    client.snapshot = content_snapshot  # type: ignore[method-assign]
+    client.observe = content_observe  # type: ignore[method-assign]
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        DoneAction(
+            action="done",
+            summary="消息已发送",
+            visible_evidence_ref="@e77",
+        ),
+        autofill_verified_done=False,
+    )
+
+    result = await make_loop(client, sessions).run(
+        instruction="确认消息已经发送",
+        raw_request="确认消息已经发送",
         session=session,
         planner=planner,
     )
@@ -759,7 +879,118 @@ async def test_search_fill_can_submit_with_enter_in_one_agent_action() -> None:
 
 
 @pytest.mark.asyncio
-async def test_search_only_goal_finishes_as_soon_as_result_url_is_confirmed() -> None:
+async def test_non_search_fill_submit_is_replanned_as_separate_actions() -> None:
+    client = FakeBsk()
+    client.url = "https://chat.deepseek.com/"
+    state = {"sent": False}
+
+    def page_text() -> str:
+        sent = '; StaticText "测试消息已经成功发送"' if state["sent"] else ""
+        return f'textbox "给 DeepSeek 发送消息" [empty] @e111{sent}'
+
+    async def chat_snapshot(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        client.snapshot_token_limits.append(int(kwargs.get("max_tokens") or 0))
+        return {"text": page_text(), "tab_id": 11}
+
+    async def chat_observe(_session_id: str, **_kwargs: Any) -> dict[str, Any]:
+        client.observe_count += 1
+        return {"text": page_text()}
+
+    async def send_message(
+        _session_id: str,
+        key: str,
+        *,
+        target: str | None = None,
+    ) -> dict[str, Any]:
+        client.pressed.append((key, target))
+        state["sent"] = True
+        return {}
+
+    client.snapshot = chat_snapshot  # type: ignore[method-assign]
+    client.observe = chat_observe  # type: ignore[method-assign]
+    client.press = send_message  # type: ignore[method-assign]
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        FillAction(
+            action="fill",
+            target="@e111",
+            value="测试消息",
+            submit=True,
+        ),
+        FillAction(
+            action="fill",
+            target="@e111",
+            value="测试消息",
+            submit=False,
+        ),
+        PressAction(action="press", key="Enter", target="@e111", reason="发送消息"),
+        DoneAction(
+            action="done",
+            summary="消息已发送",
+            visible_evidence="测试消息已经成功发送",
+        ),
+        autofill_verified_done=False,
+    )
+
+    result = await make_loop(client, sessions).run(
+        instruction="在 DeepSeek 中发送测试消息",
+        raw_request="在 DeepSeek 中发送测试消息",
+        session=session,
+        planner=planner,
+    )
+
+    assert result.success is True
+    assert result.steps == 4
+    assert client.fills == [("@e111", "测试消息")]
+    assert client.pressed == [("Enter", "@e111")]
+    assert client.help_count == 1
+    assert any(
+        "fill.submit is only a search-box shortcut" in item
+        for item in planner.histories[1]
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_non_search_fill_submit_is_fused() -> None:
+    client = FakeBsk()
+
+    async def chat_snapshot(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        client.snapshot_token_limits.append(int(kwargs.get("max_tokens") or 0))
+        return {
+            "text": (
+                'textbox "给 DeepSeek 发送消息" @e111; '
+                'textbox "另一个聊天输入框" @e112; '
+                'textbox "第三个聊天输入框" @e113'
+            ),
+            "tab_id": 11,
+        }
+
+    client.snapshot = chat_snapshot  # type: ignore[method-assign]
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        FillAction(action="fill", target="@e111", value="一", submit=True),
+        FillAction(action="fill", target="@e112", value="二", submit=True),
+        FillAction(action="fill", target="@e113", value="三", submit=True),
+    )
+
+    with pytest.raises(LoopFailure) as caught:
+        await make_loop(client, sessions).run(
+            instruction="在聊天页面发送消息",
+            raw_request="在聊天页面发送消息",
+            session=session,
+            planner=planner,
+        )
+
+    assert caught.value.code == "ACTION_REJECTED"
+    assert caught.value.status == "needs_user"
+    assert client.fills == []
+    assert client.pressed == []
+
+
+@pytest.mark.asyncio
+async def test_search_result_completion_is_decided_by_agent() -> None:
     client = FakeBsk()
     client.url = "https://www.bing.com/"
 
@@ -788,6 +1019,8 @@ async def test_search_only_goal_finishes_as_soon_as_result_url_is_confirmed() ->
     session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
     planner = FakePlanner(
         FillAction(action="fill", target="@e12", value="111", submit=True),
+        DoneAction(action="done", summary="搜索结果页已经显示"),
+        DoneAction(action="done", summary="复核后确认搜索结果页已经显示"),
     )
 
     result = await make_loop(client, sessions).run(
@@ -798,9 +1031,10 @@ async def test_search_only_goal_finishes_as_soon_as_result_url_is_confirmed() ->
     )
 
     assert result.success is True
-    assert result.steps == 1
+    assert result.steps == 3
     assert result.current_url == "https://www.bing.com/search?q=111&form=QBRE"
-    assert len(planner.observations) == 1
+    assert len(planner.observations) == 3
+    assert client.observe_count == 1
     assert client.fills == [("@e12", "111")]
     assert client.pressed == [("Enter", None)]
 
@@ -867,6 +1101,68 @@ def test_observation_hash_ignores_volatile_query_args_and_element_refs() -> None
     assert AgentLoop._observation_hash(first) != AgentLoop._observation_hash(changed)
 
 
+def test_page_route_key_ignores_queries_but_preserves_spa_routes() -> None:
+    assert AgentLoop._page_route_key(
+        "https://www.bing.com/search?q=111&form=QBRE&cvid=one"
+    ) == AgentLoop._page_route_key(
+        "https://www.bing.com/search?cvid=two&q=222&form=ANSPH1"
+    )
+    assert AgentLoop._page_route_key(
+        "https://music.163.com/#/search/m/?s=%E6%99%B4%E5%A4%A9&type=1"
+    ) != AgentLoop._page_route_key(
+        "https://music.163.com/#/song?id=1"
+    )
+    assert AgentLoop._page_route_key(
+        "https://github.com/example/project#readme"
+    ) == AgentLoop._page_route_key(
+        "https://github.com/example/project#installation"
+    )
+
+
+def test_observation_hash_ignores_url_query_change_without_body_change() -> None:
+    first = "Current URL: https://www.bing.com/search?q=111\n相同页面正文"
+    second = "Current URL: https://www.bing.com/search?q=222\n相同页面正文"
+
+    assert AgentLoop._observation_hash(first) == AgentLoop._observation_hash(second)
+
+
+def test_observation_hash_ignores_compact_and_deep_runtime_wrappers() -> None:
+    compact = (
+        "Current URL: https://chat.deepseek.com/a/chat/s/1\n"
+        "[Runtime observation mode: compact snapshot, max_tokens=4000; "
+        "choose observe only when deeper semantic page detail is needed.]\n"
+        'StaticText "加载失败，你可以"\nbutton "重试加载" @e114'
+    )
+    deep = (
+        "Current URL: https://chat.deepseek.com/a/chat/s/1\n"
+        "[Completion semantic observation: DOM text may contain off-screen nodes.]\n"
+        'StaticText "加载失败，你可以"\nbutton "重试加载" @e114'
+    )
+
+    assert AgentLoop._observation_hash(compact) == AgentLoop._observation_hash(deep)
+
+
+def test_action_url_effect_uses_action_context_instead_of_parameter_names() -> None:
+    navigation = NavigateAction(
+        action="navigate",
+        url="https://example.com/?form=checkout",
+    )
+    search_submit = FillAction(action="fill", target="@e1", value="111", submit=True)
+
+    assert AgentLoop._action_url_effect_confirmed(
+        navigation,
+        previous_url="https://example.com/?form=login",
+        current_url="https://example.com/?form=checkout",
+        direct_result=True,
+    )
+    assert not AgentLoop._action_url_effect_confirmed(
+        search_submit,
+        previous_url="https://www.bing.com/search?q=111&form=old&cvid=one",
+        current_url="https://www.bing.com/search?q=111&form=new&cvid=two",
+        direct_result=False,
+    )
+
+
 def test_fill_action_signature_ignores_renumbered_snapshot_ref() -> None:
     first = FillAction(action="fill", target="@e4", value="111", submit=True)
     second = FillAction(action="fill", target="@e17", value="111", submit=True)
@@ -874,6 +1170,54 @@ def test_fill_action_signature_ignores_renumbered_snapshot_ref() -> None:
 
     assert AgentLoop._action_signature(first) == AgentLoop._action_signature(second)
     assert AgentLoop._action_signature(first) != AgentLoop._action_signature(different)
+
+
+def test_click_action_signature_ignores_reworded_reason() -> None:
+    first = ClickAction(action="click", target="@e114", reason="重试加载")
+    second = ClickAction(action="click", target="@e114", reason="再次尝试恢复页面")
+
+    assert AgentLoop._action_signature(first) == AgentLoop._action_signature(second)
+
+
+@pytest.mark.asyncio
+async def test_click_observe_click_cycle_is_fused_on_unchanged_page() -> None:
+    client = FakeBsk()
+
+    async def failed_snapshot(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        client.snapshot_token_limits.append(int(kwargs.get("max_tokens") or 0))
+        return {
+            "text": 'StaticText "加载失败，你可以"\nbutton "重试加载" @e114',
+            "tab_id": 11,
+        }
+
+    async def failed_observe(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        client.observe_count += 1
+        client.observe_token_limits.append(int(kwargs.get("max_tokens") or 0))
+        return {"text": 'StaticText "加载失败，你可以"\nbutton "重试加载" @e114'}
+
+    client.snapshot = failed_snapshot  # type: ignore[method-assign]
+    client.observe = failed_observe  # type: ignore[method-assign]
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        ObserveAction(action="observe", reason="确认加载失败状态"),
+        ClickAction(action="click", target="@e114", reason="重试加载"),
+        ClickAction(action="click", target="@e114", reason="再次尝试恢复页面"),
+        ClickAction(action="click", target="@e114", reason="最后再试一次"),
+    )
+
+    with pytest.raises(LoopFailure) as caught:
+        await make_loop(client, sessions).run(
+            instruction="确认当前页面回复内容是否真实",
+            raw_request="确认当前页面回复内容是否真实",
+            session=session,
+            planner=planner,
+        )
+
+    assert caught.value.code == "ACTION_REJECTED"
+    assert caught.value.status == "needs_user"
+    assert client.clicks == ["@e114", "@e114"]
+    assert client.observe_count == 2
 
 
 @pytest.mark.asyncio
@@ -911,6 +1255,51 @@ async def test_semantically_unchanged_mutations_stop_after_one_observation_recov
     assert caught.value.status == "needs_user", str(caught.value)
     assert len(client.fills) == 3
     assert client.observe_count == 1
+
+
+@pytest.mark.asyncio
+async def test_real_navigation_resets_stagnation_recovery_fuse() -> None:
+    client = FakeBsk()
+    client.url = "https://example.com/a"
+
+    async def page_snapshot(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        client.snapshot_token_limits.append(int(kwargs.get("max_tokens") or 0))
+        page = "A" if client.url.endswith("/a") else "B"
+        return {"text": f"页面 {page} 已经显示稳定内容", "tab_id": 11}
+
+    async def page_observe(_session_id: str, **_kwargs: Any) -> dict[str, Any]:
+        client.observe_count += 1
+        page = "A" if client.url.endswith("/a") else "B"
+        return {"text": f"页面 {page} 已经显示稳定内容"}
+
+    client.snapshot = page_snapshot  # type: ignore[method-assign]
+    client.observe = page_observe  # type: ignore[method-assign]
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        NavigateAction(action="navigate", url="https://example.com/a"),
+        NavigateAction(action="navigate", url="https://example.com/a"),
+        NavigateAction(action="navigate", url="https://example.com/b"),
+        NavigateAction(action="navigate", url="https://example.com/b"),
+        DoneAction(
+            action="done",
+            summary="已切换到目标地址",
+            visible_evidence="页面 B 已经显示稳定内容",
+        ),
+        autofill_verified_done=False,
+    )
+
+    result = await make_loop(client, sessions).run(
+        instruction="将地址切换为 https://example.com/b",
+        raw_request="将地址切换为 https://example.com/b",
+        session=session,
+        planner=planner,
+    )
+
+    assert result.success is True
+    assert result.steps == 5
+    assert client.url == "https://example.com/b"
+    assert client.observe_count == 2
 
 
 @pytest.mark.asyncio
