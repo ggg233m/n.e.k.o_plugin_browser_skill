@@ -6,13 +6,16 @@ import asyncio
 import hashlib
 import json
 import os
+import platform
 import re
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -22,6 +25,89 @@ _SECRET_RE = re.compile(
     r"(?i)(password|passwd|passcode|token|secret|api[_-]?key|authorization|cookie)"
     r"\s*[:=]\s*([^\s,;]+)"
 )
+
+BUNDLED_BSK_SELECTOR = "bundled"
+BUNDLED_BSK_VERSION = "0.1.10"
+
+_BUNDLED_BSK_ASSETS: dict[str, dict[str, str]] = {
+    "darwin-arm64": {
+        "path": "darwin-arm64/bsk",
+        "sha256": "357452c2d9e15f3b24a088767eb4447dc56134ee0e32bf89c815e7b543ba987e",
+    },
+    "darwin-x64": {
+        "path": "darwin-x64/bsk",
+        "sha256": "ce96809704657e9d18cb51a80d856bc49e41a22767cb3177f6d27e10a1ab275a",
+    },
+    "linux-arm64": {
+        "path": "linux-arm64/bsk",
+        "sha256": "e4839a89b68ea49f96612da19f7869c2e298f5c7517f70d9dd85f57559325cbc",
+    },
+    "linux-x64": {
+        "path": "linux-x64/bsk",
+        "sha256": "7d94b5cabb82a5fc36d7af2032e7672cf41d6e625541dd4ce242ed80c5056f4d",
+    },
+    "windows-x64": {
+        "path": "windows-x64/bsk.exe",
+        "sha256": "e24090da00c9523eef484ef60ff932e8281183ab59b90ec95d6b22b9ee5a3e37",
+    },
+}
+
+
+def bundled_platform_key(
+    *,
+    system: str | None = None,
+    machine: str | None = None,
+) -> str | None:
+    """Return the release platform key used by BrowserSkill's manifest."""
+    system_id = str(system or platform.system()).strip().casefold()
+    machine_id = str(machine or platform.machine()).strip().casefold()
+    os_id = {
+        "darwin": "darwin",
+        "linux": "linux",
+        "windows": "windows",
+    }.get(system_id)
+    arch_id = {
+        "aarch64": "arm64",
+        "arm64": "arm64",
+        "amd64": "x64",
+        "x86_64": "x64",
+    }.get(machine_id)
+    if not os_id or not arch_id:
+        return None
+    key = f"{os_id}-{arch_id}"
+    return key if key in _BUNDLED_BSK_ASSETS else None
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _make_executable(path: Path) -> None:
+    if os.name == "nt":
+        return
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+@lru_cache(maxsize=8)
+def resolve_bundled_executable(platform_key: str | None = None) -> str | None:
+    """Select and verify the bundled CLI for the current supported platform."""
+    key = platform_key or bundled_platform_key()
+    asset = _BUNDLED_BSK_ASSETS.get(str(key or ""))
+    if asset is None:
+        return None
+
+    plugin_root = Path(__file__).resolve().parent.parent
+    executable = plugin_root / "bin" / Path(asset["path"])
+    if not executable.is_file():
+        raise RuntimeError(f"bundled BrowserSkill executable is missing: {asset['path']}")
+    if not secrets.compare_digest(_sha256_file(executable), asset["sha256"]):
+        raise RuntimeError(f"bundled BrowserSkill executable failed verification: {asset['path']}")
+    _make_executable(executable)
+    return str(executable.resolve())
 
 
 def redact_text(value: str, *, limit: int = 2000) -> str:
@@ -106,6 +192,7 @@ class BskClient:
         direct_request_help: bool = False,
     ) -> None:
         self._explicit_executable = executable
+        self._executable_error = ""
         self._logger = logger
         self._debug_enabled = debug_enabled
         self._direct_request_help = direct_request_help
@@ -118,12 +205,30 @@ class BskClient:
     @property
     def executable(self) -> str | None:
         if self._explicit_executable:
-            candidate = Path(os.path.expandvars(self._explicit_executable)).expanduser()
+            configured = str(self._explicit_executable).strip()
+            normalized = configured.replace("\\", "/").casefold()
+            if normalized in {BUNDLED_BSK_SELECTOR, "bin/bsk.exe"}:
+                try:
+                    resolved = resolve_bundled_executable()
+                except (OSError, RuntimeError) as exc:
+                    self._executable_error = redact_text(str(exc), limit=500)
+                    return None
+                if resolved:
+                    self._executable_error = ""
+                    return resolved
+                self._executable_error = (
+                    f"no bundled bsk build for {platform.system()} {platform.machine()}"
+                )
+                return None
+            candidate = Path(os.path.expandvars(configured)).expanduser()
             if not candidate.is_absolute():
                 candidate = Path(__file__).resolve().parent.parent / candidate
             if candidate.is_file():
+                self._executable_error = ""
                 return str(candidate.resolve())
+            self._executable_error = ""
             return None
+        self._executable_error = ""
         return shutil.which("bsk")
 
     def spawn_peer(self) -> "BskClient":
@@ -315,7 +420,7 @@ class BskClient:
         if not self.executable:
             return Availability(
                 ready=False,
-                reasons=["BSK_NOT_INSTALLED"],
+                reasons=["BSK_BUNDLE_ERROR" if self._executable_error else "BSK_NOT_INSTALLED"],
             )
         try:
             version = await self.version()

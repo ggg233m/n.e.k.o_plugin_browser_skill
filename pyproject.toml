@@ -1,4 +1,7 @@
 [project]
 name = "browser_skill"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = []
+
+[tool.neko.build]
+exclude_dirs = ["scripts"]

@@ -29,7 +29,7 @@ keywords = [
     "steer browser",
     "browser progress",
 ]
-version = "0.1.0"
+version = "0.1.4"
 id = "browser_skill"
 entry = "plugin.plugins.browser_skill:BrowserSkillPlugin"
 
@@ -55,7 +55,7 @@ enabled = true
 auto_start = true
 
 [browser_skill]
-bsk_executable = "bin/bsk.exe"
+bsk_executable = "bundled"
 browser_label = ""
 routing_mode = "auto"
 auto_start_daemon = true

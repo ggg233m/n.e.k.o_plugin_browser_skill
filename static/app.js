@@ -3,6 +3,7 @@ const $=id=>document.getElementById(id);
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 const controls=['refreshBtn','daemonBtn','closeBtn','saveBtn'];
 let uiBusy=false, refreshInFlight=false, pluginReachable=true;
+let configuredBskValue='', resolvedBundledPath='';
 
 function unwrap(value){
   let raw=value;
@@ -70,7 +71,7 @@ function render(data,{applySettings=true}={}){
   $('cliVersion').textContent=availability.version
     ? `bsk CLI ${availability.version}${cli.bundled_selected?' · 内置':''}`
     : cli.bundled_selected
-      ? `bsk CLI ${cli.bundled_version||'0.1.9'} · 内置`
+      ? `bsk CLI ${cli.bundled_version||'0.1.10'} · 内置`
       : '未检测到';
   $('browserState').textContent=browsers.length?`${browsers.length} 个在线`:(availability.reasons||[]).join(', ')||'未连接';
   $('effectiveRoute').textContent=routeText(routing.effective);
@@ -83,7 +84,12 @@ function render(data,{applySettings=true}={}){
     ? `自动模式当前采用“${routeText(routing.effective)}”。不确定线路会同时提供原生和后备入口，插件会去重，只有一条浏览队列。`
     : `手动模式“${routeText(routing.requested)}”已生效。原生工具：${routing.native_tool_registered?'开':'关'}；后备入口：${routing.fallback_registered?'开':'关'}。`;
   const map={bskExecutable:'bsk_executable',browserLabel:'browser_label',routingMode:'routing_mode',autoStartDaemon:'auto_start_daemon',sessionScope:'session_scope',reuseWindow:'reuse_existing_window',releaseIdleControl:'release_control_when_idle',allowExtraTabs:'allow_additional_agent_tabs',maxSteps:'max_steps',activeTimeout:'active_timeout_seconds',duplicateSeconds:'duplicate_suppression_seconds',keepaliveSeconds:'session_keepalive_seconds',snapshotTokens:'snapshot_max_tokens',scrollMaxPages:'scroll_max_pages',scrollTokens:'scroll_snapshot_max_tokens',scrollSettleMs:'scroll_settle_ms',livePageChars:'live_page_max_chars',allowTabBorrow:'allow_tab_borrow',visionFallback:'enable_vision_fallback',keepMedia:'keep_session_for_media',debugLogging:'debug_logging'};
-  if(applySettings)Object.entries(map).forEach(([id,key])=>setValue(id,settings[key]));
+  if(applySettings){
+    Object.entries(map).forEach(([id,key])=>setValue(id,settings[key]));
+    configuredBskValue=String(settings.bsk_executable??'');
+    resolvedBundledPath=String(cli.resolved_path||'');
+    if(cli.bundled_selected)setValue('bskExecutable',resolvedBundledPath);
+  }
   const list=$('browserList');list.replaceChildren();
   if(!browsers.length){const p=document.createElement('p');p.className='muted';p.textContent='暂无浏览器信息';list.append(p);}
   browsers.forEach(browser=>{const row=document.createElement('div');row.className='browser-card';const left=document.createElement('div');const strong=document.createElement('strong');strong.textContent=`${browser.browser_name||'browser'} ${browser.browser_version||''}`;const small=document.createElement('small');small.textContent=`${browser.label||browser.instance_id||'未命名'} · 扩展 ${browser.extension_version||'未知'}`;left.append(strong,document.createElement('br'),small);const right=document.createElement('small');right.textContent=browser.version_skew?'版本不匹配':`${browser.session_count||0} 个会话`;row.append(left,right);list.append(row);});
@@ -93,8 +99,12 @@ function render(data,{applySettings=true}={}){
     : 'Debug 日志已关闭。';
 }
 
+function bskSettingValue(){
+  const displayed=$('bskExecutable').value.trim();
+  return configuredBskValue.toLowerCase()==='bundled'&&displayed===resolvedBundledPath?'bundled':displayed;
+}
 function formSettings(){return {
-  bsk_executable:$('bskExecutable').value.trim(),browser_label:$('browserLabel').value.trim(),routing_mode:$('routingMode').value,auto_start_daemon:$('autoStartDaemon').checked,session_scope:$('sessionScope').value,reuse_existing_window:$('reuseWindow').checked,release_control_when_idle:$('releaseIdleControl').checked,allow_additional_agent_tabs:$('allowExtraTabs').checked,
+  bsk_executable:bskSettingValue(),browser_label:$('browserLabel').value.trim(),routing_mode:$('routingMode').value,auto_start_daemon:$('autoStartDaemon').checked,session_scope:$('sessionScope').value,reuse_existing_window:$('reuseWindow').checked,release_control_when_idle:$('releaseIdleControl').checked,allow_additional_agent_tabs:$('allowExtraTabs').checked,
   max_steps:Number($('maxSteps').value),active_timeout_seconds:Number($('activeTimeout').value),duplicate_suppression_seconds:Number($('duplicateSeconds').value),session_keepalive_seconds:Number($('keepaliveSeconds').value),snapshot_max_tokens:Number($('snapshotTokens').value),scroll_max_pages:Number($('scrollMaxPages').value),scroll_snapshot_max_tokens:Number($('scrollTokens').value),scroll_settle_ms:Number($('scrollSettleMs').value),live_page_max_chars:Number($('livePageChars').value),
   allow_tab_borrow:$('allowTabBorrow').checked,enable_vision_fallback:$('visionFallback').checked,keep_session_for_media:$('keepMedia').checked,debug_logging:$('debugLogging').checked
 };}

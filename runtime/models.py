@@ -52,7 +52,7 @@ class Availability(StrictModel):
 
 
 class RuntimeSettings(StrictModel):
-    bsk_executable: str = Field(default="bin/bsk.exe", max_length=4096)
+    bsk_executable: str = Field(default="bundled", max_length=4096)
     browser_label: str = ""
     routing_mode: Literal["auto", "native", "fallback", "hybrid"] = "auto"
     auto_start_daemon: bool = True

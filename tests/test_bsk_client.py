@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
 from pathlib import Path
 from typing import Any, Iterable
 
 import pytest
 from plugin.plugins.browser_skill.runtime.bsk_client import (
+    BUNDLED_BSK_SELECTOR,
+    BUNDLED_BSK_VERSION,
     BskClient,
     BskCommandError,
     BskCommandResult,
+    bundled_platform_key,
     redact_text,
+    resolve_bundled_executable,
 )
 
 
@@ -43,11 +48,11 @@ class PreflightClient(BskClient):
         self.skew = skew or []
 
     async def version(self) -> str:
-        return "0.1.9"
+        return "0.1.10"
 
     async def run(self, args: Iterable[str], **kwargs: Any) -> BskCommandResult:
         data = {
-            "daemon_version": "0.1.9",
+            "daemon_version": "0.1.10",
             "protocol_version": "1.0",
             "browsers": self.browsers,
             "sessions": [],
@@ -109,6 +114,13 @@ async def test_diagnostics_and_session_lifecycle_have_expected_binding() -> None
 
 
 @pytest.mark.asyncio
+async def test_daemon_start_uses_explicit_command() -> None:
+    client = RecordingClient()
+    await client.start_daemon()
+    assert client.calls == [(["daemon", "start"], None)]
+
+
+@pytest.mark.asyncio
 async def test_cli_version_is_cached_for_repeated_preflight_checks() -> None:
     client = RecordingClient()
 
@@ -124,7 +136,7 @@ def browser_entry(instance_id: str, *, label: str = "Personal") -> dict[str, Any
         "instance_id": instance_id,
         "browser_name": "Chrome",
         "browser_version": "140.0",
-        "extension_version": "0.1.9",
+        "extension_version": "0.1.10",
         "label": label,
         "session_count": 0,
         "connected_at_ms": 1_700_000_000_000,
@@ -202,11 +214,70 @@ def test_error_mapping_and_redaction() -> None:
 
 
 def test_relative_executable_resolves_from_plugin_root() -> None:
-    client = BskClient(executable="bin/bsk.exe")
+    client = BskClient(executable="bin/LICENSE.BrowserSkill")
     executable = Path(str(client.executable))
-    assert executable.name == "bsk.exe"
+    assert executable.name == "LICENSE.BrowserSkill"
     assert executable.parent.name == "bin"
     assert executable.is_file()
+
+
+@pytest.mark.parametrize(
+    ("system", "machine", "expected"),
+    [
+        ("Darwin", "arm64", "darwin-arm64"),
+        ("Darwin", "x86_64", "darwin-x64"),
+        ("Linux", "aarch64", "linux-arm64"),
+        ("Linux", "amd64", "linux-x64"),
+        ("Windows", "AMD64", "windows-x64"),
+        ("Windows", "ARM64", None),
+        ("FreeBSD", "x86_64", None),
+    ],
+)
+def test_bundled_platform_detection(
+    system: str,
+    machine: str,
+    expected: str | None,
+) -> None:
+    assert bundled_platform_key(system=system, machine=machine) == expected
+
+
+@pytest.mark.parametrize(
+    "platform_key",
+    ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "windows-x64"],
+)
+def test_each_bundled_platform_resolves_direct_executable(platform_key: str) -> None:
+    executable = Path(str(resolve_bundled_executable(platform_key)))
+    assert executable.is_file()
+    assert executable.is_relative_to(Path(__file__).resolve().parent.parent / "bin")
+
+
+@pytest.mark.asyncio
+async def test_bundled_cli_for_current_platform_reports_expected_version() -> None:
+    if bundled_platform_key() is None:
+        pytest.skip("current platform has no BrowserSkill release asset")
+    client = BskClient(executable=BUNDLED_BSK_SELECTOR)
+    executable = Path(str(client.executable))
+    assert executable.is_file()
+    plugin_bin = Path(__file__).resolve().parent.parent / "bin"
+    assert executable.is_relative_to(plugin_bin)
+    assert ".runtime" not in executable.parts
+    assert await client.version() == BUNDLED_BSK_VERSION
+
+
+@pytest.mark.asyncio
+async def test_preflight_distinguishes_missing_custom_path_from_broken_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing = await BskClient(executable="missing/bsk").preflight()
+    assert missing.reasons == ["BSK_NOT_INSTALLED"]
+
+    def broken_bundle(_platform_key: str | None = None) -> str:
+        raise RuntimeError("checksum mismatch")
+
+    module = sys.modules[BskClient.__module__]
+    monkeypatch.setattr(module, "resolve_bundled_executable", broken_bundle)
+    broken = await BskClient(executable=BUNDLED_BSK_SELECTOR).preflight()
+    assert broken.reasons == ["BSK_BUNDLE_ERROR"]
 
 
 class HangingProcess:

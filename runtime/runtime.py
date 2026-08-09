@@ -756,6 +756,10 @@ class BrowserSkillRuntime:
                 "未安装 BrowserSkill CLI",
                 "请按 BrowserSkill 官方文档安装 bsk，并在 Chrome/Edge 安装扩展。",
             ),
+            "BSK_BUNDLE_ERROR": (
+                "内置 BrowserSkill CLI 不可用",
+                "当前系统不受内置版本支持，或内置文件校验失败；可安装官方 bsk 并在插件中填写绝对路径。",
+            ),
             "BSK_EXTENSION_OFFLINE": (
                 "BrowserSkill 扩展未连接",
                 "打开浏览器扩展并确认状态为 connected。",
@@ -795,7 +799,8 @@ class BrowserSkillRuntime:
                 code=reason,
                 message=message,
                 hint=hint,
-                retryable=reason not in {"BSK_NOT_INSTALLED", "AGENT_MODEL_UNAVAILABLE"},
+                retryable=reason
+                not in {"BSK_NOT_INSTALLED", "BSK_BUNDLE_ERROR", "AGENT_MODEL_UNAVAILABLE"},
             ),
         )
 

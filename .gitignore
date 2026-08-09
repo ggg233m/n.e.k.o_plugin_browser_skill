@@ -14,3 +14,10 @@ build/
 store.db
 .env
 .DS_Store
+
+# Materialized by scripts/fetch_bsk.py before tests and packaging.
+/bin/darwin-arm64/bsk
+/bin/darwin-x64/bsk
+/bin/linux-arm64/bsk
+/bin/linux-x64/bsk
+/bin/windows-x64/bsk.exe

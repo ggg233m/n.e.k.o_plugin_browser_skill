@@ -55,8 +55,8 @@
       </div>
       <div class="form-grid">
         <div class="field wide">
-          <div class="field-caption"><label for="bskExecutable">bsk.exe 路径</label><button type="button" class="help-tip open-right" aria-label="查看 bsk 路径说明" data-tip="插件当前内置 Windows x64 的 bsk CLI 0.1.9，默认路径为 bin/bsk.exe。也可以填写其他 bsk.exe 的绝对路径；留空时从系统 PATH 查找。">?</button></div>
-          <input id="bskExecutable" type="text" spellcheck="false" placeholder="默认 bin/bsk.exe（bsk CLI 0.1.9）">
+          <div class="field-caption"><label for="bskExecutable">bsk 路径</label><button type="button" class="help-tip open-right" aria-label="查看 bsk 路径说明" data-tip="默认显示当前系统对应的内置 bsk CLI 0.1.10 真实绝对路径，位于插件自身的 bin/平台目录。支持 macOS Intel/Apple Silicon、Linux x64/ARM64 和 Windows x64。也可改为其他 bsk 的绝对路径；留空时从系统 PATH 查找。">?</button></div>
+          <input id="bskExecutable" type="text" spellcheck="false" placeholder="自动显示当前平台的内置 bsk 绝对路径">
         </div>
         <div class="field">
           <div class="field-caption"><label for="browserLabel">浏览器标签 / instance ID</label><button type="button" class="help-tip open-right" aria-label="查看浏览器实例说明" data-tip="用于多个 Chrome 或 Edge 同时连接时指定目标浏览器。可填写扩展中设置的浏览器标签，或诊断区域显示的 instance ID。只有一个浏览器时建议留空，由插件自动选择。">?</button></div>
@@ -79,7 +79,7 @@
             <option value="conversation">按对话复用</option>
           </select>
         </div>
-        <div class="toggle-item switch-row"><label><input id="autoStartDaemon" type="checkbox"><span>连接失败时自动启动 daemon</span></label><button type="button" class="help-tip" aria-label="查看 daemon 自动启动说明" data-tip="当 bsk CLI 已安装但本地 daemon 没有运行时，插件自动执行 bsk daemon start 后重试连接。它不会安装或更新 BrowserSkill；关闭后需要用户手动启动 daemon。">?</button></div>
+        <div class="toggle-item switch-row"><label><input id="autoStartDaemon" type="checkbox"><span>连接失败时自动启动 daemon</span></label><button type="button" class="help-tip" aria-label="查看 daemon 自动启动说明" data-tip="当 bsk CLI 已安装但本地 daemon 没有运行时，插件自动执行 bsk daemon start 后重试连接。它不会安装或更新 BrowserSkill；停用插件时只关闭本插件登记的会话，不会停止可能由其他客户端共享的 daemon。">?</button></div>
       </div>
       <p id="routeHint" class="hint"></p>
     </section>
@@ -144,6 +144,6 @@
       <button id="saveBtn" class="primary">保存并应用</button>
     </footer>
   </main>
-  <script src="app.js?v=20260805-5"></script>
+  <script src="app.js?v=20260810-4"></script>
 </body>
 </html>

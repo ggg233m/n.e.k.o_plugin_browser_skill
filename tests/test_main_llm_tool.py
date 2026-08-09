@@ -14,9 +14,16 @@ class _Logger:
     def exception(self, *_args: Any, **_kwargs: Any) -> None:
         pass
 
+    def info(self, *_args: Any, **_kwargs: Any) -> None:
+        pass
+
+    def warning(self, *_args: Any, **_kwargs: Any) -> None:
+        pass
+
 
 class _Runtime:
     def __init__(self) -> None:
+        self.events: list[str] = []
         self.steer_calls: list[dict[str, Any]] = []
         self.close_calls: list[str | None] = []
         self.active = False
@@ -33,6 +40,7 @@ class _Runtime:
         return {"accepted": True, "active": True, "message": "已更新执行方向"}
 
     async def close(self, conversation_id: str | None = None) -> None:
+        self.events.append("close_sessions")
         self.close_calls.append(conversation_id)
 
 
@@ -63,6 +71,16 @@ def test_browser_skill_exposes_one_native_main_llm_tool() -> None:
     for entry_name in ("run_browser_task", "get_browser_task_status", "steer_browser_task"):
         meta = getattr(getattr(BrowserSkillPlugin, entry_name), "__neko_event_meta__")
         assert meta.metadata["agent_hidden"] is True
+
+
+@pytest.mark.asyncio
+async def test_plugin_shutdown_closes_only_plugin_sessions() -> None:
+    plugin = _plugin()
+
+    await plugin.shutdown()
+
+    assert plugin._runtime.close_calls == [None]
+    assert plugin._runtime.events == ["close_sessions"]
 
 
 def test_auto_routing_adds_fallback_for_uncertain_native_routes() -> None:

@@ -15,7 +15,13 @@ from main_logic.omni_offline_client import route_supports_tool_calls
 from plugin.sdk.plugin import NekoPluginBase, Ok, lifecycle, llm_tool, neko_plugin, plugin_entry, ui
 
 if __package__:
-    from .runtime import BrowserSkillRuntime, RuntimeSettings
+    from .runtime import (
+        BUNDLED_BSK_SELECTOR,
+        BUNDLED_BSK_VERSION,
+        BrowserSkillRuntime,
+        RuntimeSettings,
+        bundled_platform_key,
+    )
 else:  # pragma: no cover - standalone-repository pytest collection
     # ``neko-plugin check --release /path/to/n.e.k.o_plugin_*`` executes
     # pytest with the repository itself as cwd.  Because the market-mandated
@@ -23,7 +29,13 @@ else:  # pragma: no cover - standalone-repository pytest collection
     # bare ``__init__`` module instead of as ``plugin.plugins.browser_skill``.
     # Keep that release-check collection path importable without changing the
     # canonical plugin entry used after installation.
-    from runtime import BrowserSkillRuntime, RuntimeSettings
+    from runtime import (
+        BUNDLED_BSK_SELECTOR,
+        BUNDLED_BSK_VERSION,
+        BrowserSkillRuntime,
+        RuntimeSettings,
+        bundled_platform_key,
+    )
 
 
 class _RuntimeDebugLogger:
@@ -270,10 +282,6 @@ _FALLBACK_SCHEMA: dict[str, Any] = {
     "required": ["instruction"],
 }
 
-_BUNDLED_BSK_PATH = "bin/bsk.exe"
-_BUNDLED_BSK_VERSION = "0.1.9"
-
-
 def _clamp_tab_count(value: Any) -> int:
     try:
         return min(10, max(1, int(value)))
@@ -423,10 +431,10 @@ class BrowserSkillPlugin(NekoPluginBase):
         local = await asyncio.to_thread(_read_local_settings, self._local_settings_path())
         merged = {**base, **local}
         configured_bsk = str(merged.get("bsk_executable") or "").replace("\\", "/").casefold()
-        if configured_bsk.endswith(
+        if configured_bsk == "bin/bsk.exe" or configured_bsk.endswith(
             "/bsk-v0.1.9-x86_64-pc-windows-msvc/bsk.exe"
         ):
-            merged["bsk_executable"] = _BUNDLED_BSK_PATH
+            merged["bsk_executable"] = BUNDLED_BSK_SELECTOR
         # v0.1.8 intentionally changed scrolling from local multi-page
         # batching to one observed viewport per Agent turn. Clamp older saved
         # values so existing installations upgrade without a validation error.
@@ -1238,11 +1246,13 @@ class BrowserSkillPlugin(NekoPluginBase):
             },
             "settings": self._settings.model_dump(mode="json"),
             "cli": {
-                "bundled": True,
-                "bundled_version": _BUNDLED_BSK_VERSION,
+                "bundled": bundled_platform_key() is not None,
+                "bundled_version": BUNDLED_BSK_VERSION,
+                "bundled_platform": bundled_platform_key() or "",
+                "resolved_path": self._runtime.client.executable or "",
                 "bundled_selected": (
                     self._settings.bsk_executable.replace("\\", "/").casefold()
-                    == _BUNDLED_BSK_PATH
+                    == BUNDLED_BSK_SELECTOR
                 ),
             },
             "routing": {
