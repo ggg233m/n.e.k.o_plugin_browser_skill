@@ -159,6 +159,32 @@ def planner_with_llm(llm: Any, **settings: Any) -> LLMPlanner:
 
 
 @pytest.mark.asyncio
+async def test_planner_context_removes_volatile_url_trackers_but_keeps_query() -> None:
+    llm = SequencedLLM(ModelResponse('{"action":"navigate","url":"https://example.com"}'))
+    planner = planner_with_llm(llm)
+
+    await planner.decide(
+        instruction="Search for C++ on Bing",
+        raw_request="Search for C++ on Bing",
+        observation=(
+            "Current URL: https://www.bing.com/search?q=C%2B%2B&form=QBRE&cvid=random-one\n"
+            "search results for C++"
+        ),
+        history=[
+            "Navigated to https://www.bing.com/search?q=C%2B%2B&form=ANSPH1&cvid=random-two"
+        ],
+        verification_required=False,
+    )
+
+    payload = json.loads(llm.messages[0][1]["content"])
+    assert "q=C%2B%2B" in payload["latest_observation"]
+    assert "form=" not in payload["latest_observation"]
+    assert "cvid=" not in payload["latest_observation"]
+    assert "form=" not in payload["recent_actions"][0]
+    assert "cvid=" not in payload["recent_actions"][0]
+
+
+@pytest.mark.asyncio
 async def test_truncated_plan_gets_one_compact_larger_budget_correction() -> None:
     llm = SequencedLLM(
         ModelResponse('{"action":"navigate","url":"https://exa', "length"),

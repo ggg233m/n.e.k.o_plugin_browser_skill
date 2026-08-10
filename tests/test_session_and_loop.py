@@ -1271,12 +1271,68 @@ def test_page_route_key_ignores_queries_but_preserves_spa_routes() -> None:
         "打开视频然后播放",
         "用 Bing 搜索 111 然后截图",
         "搜索 111 并点击第一个结果",
+        "打开 https://example.com 并关闭弹窗",
+        "打开 https://example.com/target，并关闭弹窗",
+        "打开 https://example.com 并登录",
+        "Open https://example.com and refresh",
+        "Search for cats and sort by date on Bing",
+        "用 Bing 搜索 111，按时间排序",
     ],
 )
 def test_compound_goals_never_use_navigation_or_search_fast_path(goal: str) -> None:
     contract = AgentLoop._completion_contract(goal, goal, None)
     assert contract.kind not in {"navigation", "search"}
     assert contract.deterministic_allowed is False
+
+
+def test_explicit_navigation_target_takes_precedence_over_start_url() -> None:
+    contract = AgentLoop._completion_contract(
+        "Open https://example.com/target",
+        "Open https://example.com/target",
+        "https://example.com/",
+    )
+
+    assert contract.kind == "navigation"
+    assert contract.target_url == "https://example.com/target"
+    assert contract.deterministic_allowed is True
+    assert AgentLoop._navigation_url_issue(
+        contract.target_url,
+        "https://example.com/",
+    ) == "path_mismatch"
+
+
+def test_named_navigation_target_does_not_match_only_a_host_suffix() -> None:
+    contract = AgentLoop._completion_contract(
+        "Open com",
+        "Open com",
+        "https://example.com/",
+    )
+
+    assert contract.kind == "generic"
+    assert contract.deterministic_allowed is False
+
+
+@pytest.mark.parametrize(
+    ("goal", "query", "host"),
+    [
+        ("search for cats on Bing", "cats", "bing.com"),
+        ("use Bing to search for cats", "cats", "bing.com"),
+        ("搜索 Google Gemini", "Google Gemini", ""),
+        ("用 Bing 搜索 Google Gemini", "Google Gemini", "bing.com"),
+        ('search for "cats and dogs" on Bing', "cats and dogs", "bing.com"),
+    ],
+)
+def test_pure_search_contract_separates_query_from_requested_engine(
+    goal: str,
+    query: str,
+    host: str,
+) -> None:
+    contract = AgentLoop._completion_contract(goal, goal, None)
+
+    assert contract.kind == "search"
+    assert contract.search_query == query
+    assert contract.expected_host == host
+    assert contract.deterministic_allowed is True
 
 
 def test_navigation_url_verifier_preserves_security_and_route_boundaries() -> None:
@@ -1292,6 +1348,43 @@ def test_navigation_url_verifier_preserves_security_and_route_boundaries() -> No
         "https://example.com/#/wanted",
         "https://example.com/#/wrong",
     ) == "hash_route_mismatch"
+    assert AgentLoop._navigation_url_issue(
+        "https://example.com/#/song?id=1",
+        "https://example.com/#/song?id=2",
+    ) == "hash_query_mismatch"
+
+
+def test_navigation_url_verifier_ignores_only_extra_or_volatile_tracking_parameters() -> None:
+    assert AgentLoop._navigation_url_issue(
+        "https://example.com/path?q=111&utm_source=first",
+        "https://example.com/path?q=111&utm_source=second&extra=current-only",
+    ) is None
+    assert AgentLoop._navigation_url_issue(
+        "https://example.com/#/song?id=1&utm_campaign=first",
+        "https://example.com/#/song?id=1&utm_campaign=second&extra=current-only",
+    ) is None
+    assert AgentLoop._navigation_url_issue(
+        "https://example.com/path?q=111",
+        "https://example.com/path?q=222&utm_source=random",
+    ) == "query_mismatch"
+
+
+def test_full_url_key_ignores_known_search_tracking_but_preserves_semantics() -> None:
+    assert AgentLoop._full_url_key(
+        "https://www.bing.com/search?q=111&form=old&cvid=one"
+    ) == AgentLoop._full_url_key(
+        "https://www.bing.com/search?q=111&form=new&cvid=two"
+    )
+    assert AgentLoop._full_url_key(
+        "https://www.bing.com/search?q=111&form=old"
+    ) != AgentLoop._full_url_key(
+        "https://www.bing.com/search?q=222&form=new"
+    )
+    assert AgentLoop._full_url_key(
+        "https://example.com/?form=login"
+    ) != AgentLoop._full_url_key(
+        "https://example.com/?form=checkout"
+    )
 
 
 def test_search_url_requires_exact_known_query_parameter_value() -> None:

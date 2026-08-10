@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
-from urllib.parse import parse_qsl, unquote, urljoin, urlsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 from utils.llm_client import create_chat_llm_async
 from utils.token_tracker import set_call_type
@@ -86,9 +86,6 @@ _CONTENT_ENTRY_INTENT = re.compile(
     r")"
 )
 
-_SEARCH_INTENT = re.compile(
-    r"(?is)(?:搜索|搜一下|检索|查询|search\s+(?:for\s+)?|look\s+up)"
-)
 _WRITE_INTENT = re.compile(
     r"(?is)(?:填写|提交|发送|发布|购买|下单|支付|上传|删除|修改|保存|"
     r"fill|submit|send|publish|purchase|buy|pay|upload|delete|edit|save|sign\s*in|log\s*in)"
@@ -96,9 +93,6 @@ _WRITE_INTENT = re.compile(
 _CONTENT_INTENT = re.compile(
     r"(?is)(?:正文|文章|帖子|文档|内容|总结|概括|提取|读取|查看|分析|"
     r"article|post|document|content|summari[sz]e|extract|read|analy[sz]e)"
-)
-_NAVIGATION_INTENT = re.compile(
-    r"(?is)(?:打开|访问|进入|前往|导航到|open|visit|go\s+to|navigate\s+to)"
 )
 _NAVIGATION_ERROR_PAGE = re.compile(
     r"(?is)(?:ERR_[A-Z_]+|无法访问此网站|网页无法打开|找不到服务器|"
@@ -108,27 +102,40 @@ _NAVIGATION_ERROR_PAGE = re.compile(
 _SEARCH_RESULT_SIGNAL = re.compile(
     r"(?is)(?:搜索结果|相关结果|条结果|web\s+results?|search\s+results?|results?\s+for)"
 )
-_NON_DETERMINISTIC_ACTION_INTENT = re.compile(
-    r"(?is)(?:截图|播放|暂停|下载|点击|选择|勾选|切换|打印|复制|分享|"
-    r"screenshot|\bplay\b|\bpause\b|download|\bclick\b|\bselect\b|print|copy|share)"
-)
-_COMPOUND_GOAL_CONNECTOR = re.compile(
-    r"(?is)(?:然后|随后|接着|之后|完成后|并且|并再|同时|再去|"
-    r"\band\s+then\b|\bthen\b|\bafter(?:wards|\s+that)?\b|\bnext\b)"
-)
 _EXPLICIT_URL = re.compile(r"(?i)https?://[^\s<>\"']+")
-_EXPLICIT_SEARCH_SITE = re.compile(
-    r"(?is)(?:(?:用|使用|在)\s*([^\s，,。]{1,40})\s*(?:搜索|搜一下|检索|查询)|"
-    r"(?:search\s+(?:for\s+)?.+?\s+(?:on|using))\s+([^\s,.;]{1,40}))"
+_NAVIGATION_VERB = r"(?:打开|访问|进入|前往|导航到|open|visit|go\s+to|navigate\s+to)"
+_NAVIGATION_PREFIX = r"(?:(?:(?:请|麻烦)(?:帮我)?|帮我)\s*|please\s+)?"
+_NAVIGATION_OBJECT = r"(?:页面|网页|网站|网址|链接|page|webpage|website|site|url|link)"
+_SEARCH_ENGINE_NAME = r"(?:bing|必应|百度|google|duckduckgo|搜狗)"
+_AMBIGUOUS_UNQUOTED_SEARCH_QUERY = re.compile(
+    r"(?is)(?:[,，;；]|并|然后|随后|接着|之后|完成后|同时|再去|"
+    r"点击|打开(?:第|搜索结果)|排序|筛选|过滤|截图|保存|下载|关闭|刷新|"
+    r"登录|登出|退出登录|滚动|切换|"
+    r"\band\b|\bthen\b|\bafter(?:wards|\s+that)?\b|\bnext\b|"
+    r"\bclick\b|\bopen\s+the\b|\bsort\b|\bfilter\b|\bscreenshot\b|"
+    r"\bsave\b|\bdownload\b|\bclose\b|\brefresh\b|\breload\b|"
+    r"\bscroll\b|\bswitch\b|\blog\s+(?:in|out)\b|\bsign\s+in\b)"
 )
-_SEARCH_ENGINE_HOSTS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"(?i)(?<![\w.])bing(?![\w.])"), "bing.com"),
-    (re.compile(r"必应"), "bing.com"),
-    (re.compile(r"百度"), "baidu.com"),
-    (re.compile(r"(?i)(?<![\w.])google(?![\w.])"), "google.com"),
-    (re.compile(r"(?i)(?<![\w.])duckduckgo(?![\w.])"), "duckduckgo.com"),
-    (re.compile(r"搜狗"), "sogou.com"),
-)
+_AMBIGUOUS_SEARCH_SITE_SUFFIX = re.compile(r"(?is)\s+(?:on|using)\s+\S+\s*$")
+_TRACKING_QUERY_KEYS = {
+    "dclid",
+    "fbclid",
+    "gclid",
+    "igshid",
+    "mc_cid",
+    "mc_eid",
+    "msclkid",
+    "scm",
+    "spm",
+    "yclid",
+    "_ga",
+    "_gl",
+}
+_TRACKING_QUERY_PREFIXES = ("utm_", "pk_")
+_HOST_TRACKING_QUERY_KEYS = {
+    "bing.com": {"cvid", "form"},
+    "google.com": {"ei", "gs_lcrp", "oq", "sourceid", "uact", "ved"},
+}
 _SEARCH_QUERY_KEYS = {
     "q",
     "query",
@@ -140,6 +147,68 @@ _SEARCH_QUERY_KEYS = {
     "search",
     "search_query",
 }
+
+
+def _is_tracking_query_key(value: str, host: str = "") -> bool:
+    key = str(value or "").strip().casefold()
+    if key in _TRACKING_QUERY_KEYS or key.startswith(_TRACKING_QUERY_PREFIXES):
+        return True
+    canonical_host = str(host or "").strip().rstrip(".").casefold()
+    if canonical_host.startswith("www."):
+        canonical_host = canonical_host[4:]
+    return any(
+        (canonical_host == expected_host or canonical_host.endswith(f".{expected_host}"))
+        and key in keys
+        for expected_host, keys in _HOST_TRACKING_QUERY_KEYS.items()
+    )
+
+
+def _semantic_query_pairs(value: str, *, host: str = "") -> list[tuple[str, str]]:
+    return [
+        (key, item)
+        for key, item in parse_qsl(str(value or ""), keep_blank_values=True)
+        if not _is_tracking_query_key(key, host)
+    ]
+
+
+def _without_tracking_parameters(value: str) -> str:
+    """Remove known volatile tracking parameters without changing runtime-owned URLs."""
+    raw = str(value or "").strip()
+    try:
+        parsed = urlsplit(raw)
+        if not parsed.scheme or not parsed.netloc:
+            return raw
+        host = parsed.hostname or ""
+        query = urlencode(_semantic_query_pairs(parsed.query, host=host), doseq=True)
+        fragment_path, separator, fragment_query = parsed.fragment.partition("?")
+        if separator:
+            semantic_fragment_query = urlencode(
+                _semantic_query_pairs(fragment_query, host=host),
+                doseq=True,
+            )
+            fragment = (
+                f"{fragment_path}?{semantic_fragment_query}"
+                if semantic_fragment_query
+                else fragment_path
+            )
+        else:
+            fragment = parsed.fragment
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, fragment))
+    except (TypeError, ValueError, UnicodeError):
+        return raw
+
+
+def _compact_model_text(value: str) -> str:
+    """Hide volatile URL trackers from LLM context while preserving semantic parameters."""
+    text = str(value or "")
+
+    def replace(match: re.Match[str]) -> str:
+        matched = match.group(0)
+        url = matched.rstrip(".,;:!?，。；：！？)]}）】")
+        suffix = matched[len(url) :]
+        return f"{_without_tracking_parameters(url)}{suffix}"
+
+    return _EXPLICIT_URL.sub(replace, text)
 
 _QR_AUTH_CHALLENGE = re.compile(
     r"(?is)(?:"
@@ -624,8 +693,10 @@ class LLMPlanner:
             "completion_evidence_contract": (
                 (
                     "For this navigation/search goal, trusted runtime URL and submission state are "
-                    "the authoritative completion evidence. Return a concise done action once that "
-                    "state is visible; visible_evidence is optional and must never be invented."
+                    "authoritative when they match. Return a concise done action once that state is "
+                    "visible. Also include an exact visible_evidence substring or current "
+                    "visible_evidence_ref when available, so semantic evidence can decide completion "
+                    "after redirects or volatile URL components; never invent evidence."
                 )
                 if deterministic_completion
                 else (
@@ -636,8 +707,8 @@ class LLMPlanner:
                     "that grounding remains visible."
                 )
             ),
-            "recent_actions": history[-12:],
-            "latest_observation": observation[:36000],
+            "recent_actions": [_compact_model_text(item) for item in history[-12:]],
+            "latest_observation": _compact_model_text(observation)[:36000],
         }
         messages = [
             {"role": "system", "content": self._system_prompt()},
@@ -2922,11 +2993,12 @@ class AgentLoop:
 
     @staticmethod
     def _full_url_key(url: str) -> str:
-        """Normalize only scheme/authority; preserve every route and query value."""
+        """Preserve semantic URL state while ignoring volatile tracking parameters."""
         try:
-            parsed = urlsplit(str(url or "").strip())
+            stable_url = _without_tracking_parameters(str(url or "").strip())
+            parsed = urlsplit(stable_url)
             if not parsed.scheme or not parsed.netloc:
-                return str(url or "").strip()
+                return stable_url
             result = (
                 f"{parsed.scheme.casefold()}://{parsed.netloc.casefold()}"
                 f"{parsed.path or '/'}"
@@ -2937,7 +3009,7 @@ class AgentLoop:
                 result += f"#{parsed.fragment}"
             return result
         except (ValueError, UnicodeError):
-            return str(url or "").strip()
+            return _without_tracking_parameters(str(url or "").strip())
 
     @classmethod
     def _action_url_effect_confirmed(
@@ -2981,47 +3053,47 @@ class AgentLoop:
         start_url: str | None,
     ) -> CompletionContract:
         goal = str(raw_request or instruction or "").strip()
-        compound = bool(
-            _COMPOUND_GOAL_CONNECTOR.search(goal)
-            or _NON_DETERMINISTIC_ACTION_INTENT.search(goal)
-        )
-        if _CONTENT_ENTRY_INTENT.search(goal):
+        pure_search = cls._pure_search_goal(goal)
+        navigation_target = cls._pure_navigation_target(goal, start_url)
+        if pure_search is not None:
+            kind = "search"
+        elif navigation_target:
+            kind = "navigation"
+        elif _CONTENT_ENTRY_INTENT.search(goal):
             kind = "content"
         elif _WRITE_INTENT.search(goal):
             kind = "mutation"
         elif _CONTENT_INTENT.search(goal):
             kind = "content"
-        elif _SEARCH_INTENT.search(goal):
-            kind = "generic" if compound else "search"
-        elif _NAVIGATION_INTENT.search(goal):
-            kind = "generic" if compound else "navigation"
         else:
             kind = "generic"
-        target_url = str(start_url or "").strip() or cls._explicit_url_from_goal(goal)
-        expected_host = ""
+
+        target_url = ""
         target_host = ""
-        if target_url:
+        starting_url = str(start_url or "").strip()
+        if kind == "navigation":
+            target_url = navigation_target
+        elif kind == "search":
+            # A URL can be the literal search query, so only start_url is a
+            # trusted search-origin constraint.
+            target_url = starting_url
+        if starting_url:
             try:
-                target_host = cls._canonical_host(urlsplit(target_url).hostname or "")
+                target_host = cls._canonical_host(urlsplit(starting_url).hostname or "")
             except (TypeError, ValueError, UnicodeError):
                 target_host = ""
-        goal_search_host = cls._search_engine_host_from_goal(goal) if kind == "search" else ""
-        expected_host = goal_search_host or target_host
-        explicit_search_site = bool(_EXPLICIT_SEARCH_SITE.search(goal)) if kind == "search" else False
+
+        search_query = pure_search[0] if pure_search is not None else ""
+        requested_search_host = pure_search[1] if pure_search is not None else ""
+        expected_host = requested_search_host or target_host
         site_conflict = bool(
-            goal_search_host
+            requested_search_host
             and target_host
-            and not cls._host_matches(goal_search_host, target_host)
+            and not cls._host_matches(requested_search_host, target_host)
         )
-        search_query = cls._search_query_from_goal(goal) if kind == "search" else ""
         deterministic_allowed = bool(
             (kind == "navigation" and target_url)
-            or (
-                kind == "search"
-                and search_query
-                and not site_conflict
-                and (not explicit_search_site or expected_host)
-            )
+            or (kind == "search" and search_query and not site_conflict)
         )
         return CompletionContract(
             kind=kind,
@@ -3032,30 +3104,136 @@ class AgentLoop:
         )
 
     @staticmethod
-    def _explicit_url_from_goal(goal: str) -> str:
-        match = _EXPLICIT_URL.search(str(goal or ""))
-        if not match:
-            return ""
-        return match.group(0).rstrip(".,;:!?，。；：！？)]}）】")
+    def _explicit_urls_from_goal(goal: str) -> list[str]:
+        return [
+            match.group(0).rstrip(".,;:!?，。；：！？)]}）】")
+            for match in _EXPLICIT_URL.finditer(str(goal or ""))
+        ]
 
-    @staticmethod
-    def _search_engine_host_from_goal(goal: str) -> str:
-        for pattern, host in _SEARCH_ENGINE_HOSTS:
-            if pattern.search(str(goal or "")):
-                return host
+    @classmethod
+    def _pure_navigation_target(cls, goal: str, start_url: str | None) -> str:
+        """Return a target only when the entire goal proves pure navigation."""
+        text = str(goal or "").strip()
+        explicit_urls = cls._explicit_urls_from_goal(text)
+        if len(explicit_urls) == 1:
+            target = explicit_urls[0]
+            # Raw non-ASCII URL tails are ambiguous with adjacent natural-language
+            # instructions (for example “...,并关闭弹窗”). Let model evidence decide.
+            if any(ord(character) > 127 for character in target):
+                return ""
+            escaped_target = re.escape(target)
+            wrappers = (
+                rf"(?is)^\s*{_NAVIGATION_PREFIX}{_NAVIGATION_VERB}\s*"
+                rf"(?:这个|该|this|the)?\s*{escaped_target}\s*(?:{_NAVIGATION_OBJECT})?"
+                r"\s*[。.!！?？]?\s*$",
+                rf"(?is)^\s*{escaped_target}\s*[。.!！?？]?\s*$",
+            )
+            if any(re.fullmatch(pattern, text) for pattern in wrappers):
+                return target
+            return ""
+        if explicit_urls or not str(start_url or "").strip():
+            return ""
+        deictic_target = (
+            rf"(?is)^\s*{_NAVIGATION_PREFIX}{_NAVIGATION_VERB}\s*"
+            r"(?:这个|该|当前|this|the\s+current)?\s*"
+            rf"{_NAVIGATION_OBJECT}\s*[。.!！?？]?\s*$"
+        )
+        if re.fullmatch(deictic_target, text):
+            return str(start_url or "").strip()
+        named_target = re.fullmatch(
+            rf"(?is)^\s*{_NAVIGATION_PREFIX}{_NAVIGATION_VERB}\s*"
+            rf"(?P<label>[\w.\-·]+)(?:\s*{_NAVIGATION_OBJECT})?"
+            r"\s*[。.!！?？]?\s*$",
+            text,
+        )
+        if named_target:
+            label = re.sub(
+                rf"(?is){_NAVIGATION_OBJECT}$",
+                "",
+                named_target.group("label"),
+            ).strip()
+            try:
+                start_host = cls._canonical_host(
+                    urlsplit(str(start_url or "").strip()).hostname or ""
+                )
+            except (TypeError, ValueError, UnicodeError):
+                start_host = ""
+            named_engine_host = cls._known_search_engine_host(label)
+            normalized_label = "".join(
+                character
+                for character in unicodedata.normalize("NFKC", label).casefold()
+                if character.isalnum()
+            )
+            host_parts = [part for part in start_host.split(".") if part]
+            normalized_host_labels = {
+                "".join(character for character in part if character.isalnum())
+                for part in host_parts[:1]
+            }
+            if (
+                named_engine_host
+                and cls._host_matches(named_engine_host, start_host)
+            ) or (normalized_label and normalized_label in normalized_host_labels):
+                return str(start_url or "").strip()
         return ""
 
     @staticmethod
-    def _search_query_from_goal(goal: str) -> str:
+    def _known_search_engine_host(value: str) -> str:
+        engine = " ".join(str(value or "").split()).casefold()
+        return {
+            "bing": "bing.com",
+            "必应": "bing.com",
+            "百度": "baidu.com",
+            "google": "google.com",
+            "duckduckgo": "duckduckgo.com",
+            "搜狗": "sogou.com",
+        }.get(engine, "")
+
+    @staticmethod
+    def _clean_search_query(value: str) -> tuple[str, bool]:
+        raw = str(value or "").strip().rstrip("。.!！?？").strip()
+        quote_pairs = {'"': '"', "'": "'", "“": "”", "‘": "’"}
+        if raw[:1] in quote_pairs:
+            expected_quote = quote_pairs[raw[0]]
+            if not raw.endswith(expected_quote) or len(raw) < 3:
+                return "", False
+            return raw[1:-1].strip()[:2000], True
+        if raw[-1:] in set(quote_pairs.values()):
+            return "", False
+        return raw[:2000], False
+
+    @classmethod
+    def _pure_search_goal(cls, goal: str) -> tuple[str, str] | None:
+        """Parse only complete, unambiguous search-only requests."""
+        text = str(goal or "").strip()
         patterns = (
-            r"(?is)(?:搜索|搜一下|检索|查询)\s*[\"'“‘]?(.+?)[\"'”’]?\s*$",
-            r"(?is)(?:search\s+(?:for\s+)?|look\s+up\s+)[\"']?(.+?)[\"']?\s*$",
+            rf"(?is)^\s*(?:(?:请|麻烦)(?:帮我)?\s*)?(?:用|使用|在)\s*"
+            rf"(?P<engine>{_SEARCH_ENGINE_NAME})\s*(?:搜索|搜一下|检索|查询)\s*"
+            r"(?P<query>.+?)\s*$",
+            rf"(?is)^\s*(?:please\s+)?(?:use\s+)?(?P<engine>{_SEARCH_ENGINE_NAME})\s+"
+            r"to\s+(?:search(?:\s+for)?|look\s+up)\s+(?P<query>.+?)\s*$",
+            r"(?is)^\s*(?:please\s+)?(?:search(?:\s+for)?|look\s+up)\s+"
+            rf"(?P<query>.+?)\s+(?:on|using)\s+(?P<engine>{_SEARCH_ENGINE_NAME})"
+            r"\s*[.!?]?\s*$",
+            r"(?is)^\s*(?:(?:请|麻烦)(?:帮我)?\s*)?"
+            r"(?:搜索|搜一下|检索|查询)\s*(?P<query>.+?)\s*$",
+            r"(?is)^\s*(?:please\s+)?(?:search(?:\s+for)?|look\s+up)\s+"
+            r"(?P<query>.+?)\s*$",
         )
         for pattern in patterns:
-            match = re.search(pattern, str(goal or ""))
-            if match:
-                return match.group(1).strip().strip("。.!！?？")[:2000]
-        return ""
+            match = re.fullmatch(pattern, text)
+            if not match:
+                continue
+            query, quoted = cls._clean_search_query(match.group("query"))
+            if not query:
+                return None
+            engine = cls._known_search_engine_host(match.groupdict().get("engine") or "")
+            if not quoted and (
+                _AMBIGUOUS_UNQUOTED_SEARCH_QUERY.search(query)
+                or (not engine and _AMBIGUOUS_SEARCH_SITE_SUFFIX.search(query))
+            ):
+                return None
+            return query, engine
+        return None
 
     @staticmethod
     def _canonical_host(value: str) -> str:
@@ -3096,9 +3274,29 @@ class AgentLoop:
         return " ".join(normalized.split()).strip("\"'“”‘’")
 
     @staticmethod
-    def _hash_route(value: str) -> str:
-        fragment_path = unquote(str(value or "")).partition("?")[0]
-        return fragment_path if fragment_path.startswith(("/", "!/")) else ""
+    def _hash_route_parts(
+        value: str,
+        *,
+        host: str = "",
+    ) -> tuple[str, list[tuple[str, str]]]:
+        fragment_path, separator, fragment_query = str(value or "").partition("?")
+        route = unquote(fragment_path)
+        if not route.startswith(("/", "!/")):
+            return "", []
+        query = _semantic_query_pairs(fragment_query, host=host) if separator else []
+        return route, query
+
+    @staticmethod
+    def _query_pairs_are_subset(
+        expected: list[tuple[str, str]],
+        current: list[tuple[str, str]],
+    ) -> bool:
+        remaining = list(current)
+        for item in expected:
+            if item not in remaining:
+                return False
+            remaining.remove(item)
+        return True
 
     @classmethod
     def _url_origin_issue(cls, expected_url: str, current_url: str) -> str | None:
@@ -3131,18 +3329,34 @@ class AgentLoop:
             current_path = cls._normalized_url_path(current.path)
             if expected_path != current_path:
                 return "path_mismatch"
-            expected_hash_route = cls._hash_route(expected.fragment)
-            current_hash_route = cls._hash_route(current.fragment)
+            expected_hash_route, expected_hash_query = cls._hash_route_parts(
+                expected.fragment,
+                host=expected.hostname or "",
+            )
+            current_hash_route, current_hash_query = cls._hash_route_parts(
+                current.fragment,
+                host=current.hostname or "",
+            )
             if expected_hash_route or current_hash_route:
                 if expected_hash_route != current_hash_route:
                     return "hash_route_mismatch"
+                if not cls._query_pairs_are_subset(
+                    expected_hash_query,
+                    current_hash_query,
+                ):
+                    return "hash_query_mismatch"
             elif expected.fragment and expected.fragment != current.fragment:
                 return "fragment_mismatch"
-            expected_query = parse_qsl(expected.query, keep_blank_values=True)
-            current_query = parse_qsl(current.query, keep_blank_values=True)
-            for item in expected_query:
-                if item not in current_query:
-                    return "query_mismatch"
+            expected_query = _semantic_query_pairs(
+                expected.query,
+                host=expected.hostname or "",
+            )
+            current_query = _semantic_query_pairs(
+                current.query,
+                host=current.hostname or "",
+            )
+            if not cls._query_pairs_are_subset(expected_query, current_query):
+                return "query_mismatch"
         except (TypeError, ValueError, UnicodeError):
             return "url_parse_failed"
         return None
@@ -3151,10 +3365,18 @@ class AgentLoop:
     def _search_url_has_exact_query(cls, current_url: str, query: str) -> bool:
         try:
             parsed = urlsplit(str(current_url or ""))
-            parameters = list(parse_qsl(parsed.query, keep_blank_values=True))
+            parameters = _semantic_query_pairs(
+                parsed.query,
+                host=parsed.hostname or "",
+            )
             fragment_query = parsed.fragment.partition("?")[2]
             if fragment_query:
-                parameters.extend(parse_qsl(fragment_query, keep_blank_values=True))
+                parameters.extend(
+                    _semantic_query_pairs(
+                        fragment_query,
+                        host=parsed.hostname or "",
+                    )
+                )
         except (TypeError, ValueError, UnicodeError):
             return False
         expected = cls._normalize_search_query(query)
