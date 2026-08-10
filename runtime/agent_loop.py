@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
-from urllib.parse import parse_qsl, unquote_plus, urljoin, urlsplit
+from urllib.parse import parse_qsl, unquote, urljoin, urlsplit
 
 from utils.llm_client import create_chat_llm_async
 from utils.token_tracker import set_call_type
@@ -94,7 +94,7 @@ _WRITE_INTENT = re.compile(
     r"fill|submit|send|publish|purchase|buy|pay|upload|delete|edit|save|sign\s*in|log\s*in)"
 )
 _CONTENT_INTENT = re.compile(
-    r"(?is)(?:正文|文章|帖子|文档|内容|总结|概括|提取|读取|分析|"
+    r"(?is)(?:正文|文章|帖子|文档|内容|总结|概括|提取|读取|查看|分析|"
     r"article|post|document|content|summari[sz]e|extract|read|analy[sz]e)"
 )
 _NAVIGATION_INTENT = re.compile(
@@ -108,6 +108,38 @@ _NAVIGATION_ERROR_PAGE = re.compile(
 _SEARCH_RESULT_SIGNAL = re.compile(
     r"(?is)(?:搜索结果|相关结果|条结果|web\s+results?|search\s+results?|results?\s+for)"
 )
+_NON_DETERMINISTIC_ACTION_INTENT = re.compile(
+    r"(?is)(?:截图|播放|暂停|下载|点击|选择|勾选|切换|打印|复制|分享|"
+    r"screenshot|\bplay\b|\bpause\b|download|\bclick\b|\bselect\b|print|copy|share)"
+)
+_COMPOUND_GOAL_CONNECTOR = re.compile(
+    r"(?is)(?:然后|随后|接着|之后|完成后|并且|并再|同时|再去|"
+    r"\band\s+then\b|\bthen\b|\bafter(?:wards|\s+that)?\b|\bnext\b)"
+)
+_EXPLICIT_URL = re.compile(r"(?i)https?://[^\s<>\"']+")
+_EXPLICIT_SEARCH_SITE = re.compile(
+    r"(?is)(?:(?:用|使用|在)\s*([^\s，,。]{1,40})\s*(?:搜索|搜一下|检索|查询)|"
+    r"(?:search\s+(?:for\s+)?.+?\s+(?:on|using))\s+([^\s,.;]{1,40}))"
+)
+_SEARCH_ENGINE_HOSTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?i)(?<![\w.])bing(?![\w.])"), "bing.com"),
+    (re.compile(r"必应"), "bing.com"),
+    (re.compile(r"百度"), "baidu.com"),
+    (re.compile(r"(?i)(?<![\w.])google(?![\w.])"), "google.com"),
+    (re.compile(r"(?i)(?<![\w.])duckduckgo(?![\w.])"), "duckduckgo.com"),
+    (re.compile(r"搜狗"), "sogou.com"),
+)
+_SEARCH_QUERY_KEYS = {
+    "q",
+    "query",
+    "p",
+    "text",
+    "keyword",
+    "keywords",
+    "wd",
+    "search",
+    "search_query",
+}
 
 _QR_AUTH_CHALLENGE = re.compile(
     r"(?is)(?:"
@@ -294,9 +326,12 @@ class LoopFailure(RuntimeError):
 class CompletionContract:
     kind: str
     target_url: str = ""
+    expected_host: str = ""
     initial_url: str = ""
     search_query: str = ""
+    actual_search_query: str = ""
     search_submitted: bool = False
+    deterministic_allowed: bool = False
 
 
 @dataclass(frozen=True)
@@ -559,10 +594,7 @@ class LLMPlanner:
     ) -> AgentAction:
         llm = await self._ensure_llm()
         runtime_completion = completion_contract if isinstance(completion_contract, dict) else {}
-        deterministic_completion = str(runtime_completion.get("kind") or "") in {
-            "navigation",
-            "search",
-        }
+        deterministic_completion = runtime_completion.get("deterministic") is True
         user_payload = {
             "execution_goal": instruction,
             "latest_user_request": raw_request or instruction,
@@ -1315,7 +1347,9 @@ class AgentLoop:
                         verification_required=verification_required,
                         completion_contract={
                             "kind": completion_contract.kind,
+                            "deterministic": completion_contract.deterministic_allowed,
                             "target_known": bool(completion_contract.target_url),
+                            "expected_query_known": bool(completion_contract.search_query),
                             "search_submitted": completion_contract.search_submitted,
                         },
                     )
@@ -1879,10 +1913,8 @@ class AgentLoop:
                     viewport.mark_unknown("enter_may_have_navigated")
                 stale_failures = 0
                 history.append(result_text)
-                if completion_contract.kind == "navigation" and isinstance(action, NavigateAction):
-                    completion_contract.target_url = result_url or action.url
                 if search_fill_action and isinstance(action, FillAction):
-                    completion_contract.search_query = action.value
+                    completion_contract.actual_search_query = action.value
                     completion_contract.search_submitted = action.submit
                 elif (
                     completion_contract.kind == "search"
@@ -2949,23 +2981,69 @@ class AgentLoop:
         start_url: str | None,
     ) -> CompletionContract:
         goal = str(raw_request or instruction or "").strip()
+        compound = bool(
+            _COMPOUND_GOAL_CONNECTOR.search(goal)
+            or _NON_DETERMINISTIC_ACTION_INTENT.search(goal)
+        )
         if _CONTENT_ENTRY_INTENT.search(goal):
             kind = "content"
-        elif _SEARCH_INTENT.search(goal):
-            kind = "search"
         elif _WRITE_INTENT.search(goal):
             kind = "mutation"
         elif _CONTENT_INTENT.search(goal):
             kind = "content"
+        elif _SEARCH_INTENT.search(goal):
+            kind = "generic" if compound else "search"
         elif _NAVIGATION_INTENT.search(goal):
-            kind = "navigation"
+            kind = "generic" if compound else "navigation"
         else:
             kind = "generic"
+        target_url = str(start_url or "").strip() or cls._explicit_url_from_goal(goal)
+        expected_host = ""
+        target_host = ""
+        if target_url:
+            try:
+                target_host = cls._canonical_host(urlsplit(target_url).hostname or "")
+            except (TypeError, ValueError, UnicodeError):
+                target_host = ""
+        goal_search_host = cls._search_engine_host_from_goal(goal) if kind == "search" else ""
+        expected_host = goal_search_host or target_host
+        explicit_search_site = bool(_EXPLICIT_SEARCH_SITE.search(goal)) if kind == "search" else False
+        site_conflict = bool(
+            goal_search_host
+            and target_host
+            and not cls._host_matches(goal_search_host, target_host)
+        )
+        search_query = cls._search_query_from_goal(goal) if kind == "search" else ""
+        deterministic_allowed = bool(
+            (kind == "navigation" and target_url)
+            or (
+                kind == "search"
+                and search_query
+                and not site_conflict
+                and (not explicit_search_site or expected_host)
+            )
+        )
         return CompletionContract(
             kind=kind,
-            target_url=str(start_url or "").strip() if kind == "navigation" else "",
-            search_query=cls._search_query_from_goal(goal) if kind == "search" else "",
+            target_url=target_url if kind in {"navigation", "search"} else "",
+            expected_host=expected_host,
+            search_query=search_query,
+            deterministic_allowed=deterministic_allowed,
         )
+
+    @staticmethod
+    def _explicit_url_from_goal(goal: str) -> str:
+        match = _EXPLICIT_URL.search(str(goal or ""))
+        if not match:
+            return ""
+        return match.group(0).rstrip(".,;:!?，。；：！？)]}）】")
+
+    @staticmethod
+    def _search_engine_host_from_goal(goal: str) -> str:
+        for pattern, host in _SEARCH_ENGINE_HOSTS:
+            if pattern.search(str(goal or "")):
+                return host
+        return ""
 
     @staticmethod
     def _search_query_from_goal(goal: str) -> str:
@@ -2985,7 +3063,45 @@ class AgentLoop:
         return host[4:] if host.startswith("www.") else host
 
     @classmethod
-    def _navigation_url_issue(cls, expected_url: str, current_url: str) -> str | None:
+    def _host_matches(cls, expected: str, current: str) -> bool:
+        expected_host = cls._canonical_host(expected)
+        current_host = cls._canonical_host(current)
+        return bool(
+            expected_host
+            and current_host
+            and (
+                current_host == expected_host
+                or current_host.endswith(f".{expected_host}")
+            )
+        )
+
+    @staticmethod
+    def _effective_port(parsed: Any) -> int | None:
+        if parsed.port is not None:
+            return int(parsed.port)
+        if parsed.scheme.casefold() == "https":
+            return 443
+        if parsed.scheme.casefold() == "http":
+            return 80
+        return None
+
+    @staticmethod
+    def _normalized_url_path(value: str) -> str:
+        path = unquote(str(value or "/"))
+        return path.rstrip("/") or "/"
+
+    @staticmethod
+    def _normalize_search_query(value: str) -> str:
+        normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+        return " ".join(normalized.split()).strip("\"'“”‘’")
+
+    @staticmethod
+    def _hash_route(value: str) -> str:
+        fragment_path = unquote(str(value or "")).partition("?")[0]
+        return fragment_path if fragment_path.startswith(("/", "!/")) else ""
+
+    @classmethod
+    def _url_origin_issue(cls, expected_url: str, current_url: str) -> str | None:
         try:
             expected = urlsplit(str(expected_url or "").strip())
             current = urlsplit(str(current_url or "").strip())
@@ -2993,20 +3109,60 @@ class AgentLoop:
                 return "expected_url_invalid"
             if current.scheme.casefold() not in {"http", "https"} or not current.hostname:
                 return "current_url_not_http"
+            if expected.scheme.casefold() != current.scheme.casefold():
+                return "scheme_mismatch"
             if cls._canonical_host(expected.hostname) != cls._canonical_host(current.hostname):
                 return "host_mismatch"
-            expected_path = expected.path or "/"
-            current_path = current.path or "/"
-            if expected_path != "/" and expected_path.rstrip("/") != current_path.rstrip("/"):
+            if cls._effective_port(expected) != cls._effective_port(current):
+                return "port_mismatch"
+        except (TypeError, ValueError, UnicodeError):
+            return "url_parse_failed"
+        return None
+
+    @classmethod
+    def _navigation_url_issue(cls, expected_url: str, current_url: str) -> str | None:
+        origin_issue = cls._url_origin_issue(expected_url, current_url)
+        if origin_issue is not None:
+            return origin_issue
+        try:
+            expected = urlsplit(str(expected_url or "").strip())
+            current = urlsplit(str(current_url or "").strip())
+            expected_path = cls._normalized_url_path(expected.path)
+            current_path = cls._normalized_url_path(current.path)
+            if expected_path != current_path:
                 return "path_mismatch"
-            expected_query = dict(parse_qsl(expected.query, keep_blank_values=True))
-            current_query = dict(parse_qsl(current.query, keep_blank_values=True))
-            for key, value in expected_query.items():
-                if current_query.get(key) != value:
+            expected_hash_route = cls._hash_route(expected.fragment)
+            current_hash_route = cls._hash_route(current.fragment)
+            if expected_hash_route or current_hash_route:
+                if expected_hash_route != current_hash_route:
+                    return "hash_route_mismatch"
+            elif expected.fragment and expected.fragment != current.fragment:
+                return "fragment_mismatch"
+            expected_query = parse_qsl(expected.query, keep_blank_values=True)
+            current_query = parse_qsl(current.query, keep_blank_values=True)
+            for item in expected_query:
+                if item not in current_query:
                     return "query_mismatch"
         except (TypeError, ValueError, UnicodeError):
             return "url_parse_failed"
         return None
+
+    @classmethod
+    def _search_url_has_exact_query(cls, current_url: str, query: str) -> bool:
+        try:
+            parsed = urlsplit(str(current_url or ""))
+            parameters = list(parse_qsl(parsed.query, keep_blank_values=True))
+            fragment_query = parsed.fragment.partition("?")[2]
+            if fragment_query:
+                parameters.extend(parse_qsl(fragment_query, keep_blank_values=True))
+        except (TypeError, ValueError, UnicodeError):
+            return False
+        expected = cls._normalize_search_query(query)
+        return any(
+            str(key or "").casefold() in _SEARCH_QUERY_KEYS
+            and cls._normalize_search_query(value) == expected
+            for key, value in parameters
+        )
 
     @classmethod
     def _deterministic_completion_decision(
@@ -3018,8 +3174,8 @@ class AgentLoop:
         completion_observation: str,
     ) -> CompletionDecision:
         if contract.kind == "navigation":
-            if not contract.target_url:
-                return CompletionDecision(True, False, "navigation_target_unknown")
+            if not contract.deterministic_allowed or not contract.target_url:
+                return CompletionDecision(False, False, "navigation_requires_model_evidence")
             issue = cls._navigation_url_issue(contract.target_url, current_url)
             if issue is not None:
                 return CompletionDecision(True, False, issue)
@@ -3029,15 +3185,40 @@ class AgentLoop:
             return CompletionDecision(True, True, "trusted_url_matches_navigation_target")
 
         if contract.kind == "search":
+            if not contract.deterministic_allowed:
+                return CompletionDecision(False, False, "search_requires_model_evidence")
             if not contract.search_submitted:
                 return CompletionDecision(True, False, "search_not_submitted")
-            query = cls._normalize_visible_text(contract.search_query)
+            query = cls._normalize_search_query(contract.search_query)
             if not query:
                 return CompletionDecision(True, False, "search_query_unknown")
-            decoded_url = unquote_plus(str(current_url or ""))
-            url_has_query = query in cls._normalize_visible_text(decoded_url)
+            actual_query = cls._normalize_search_query(contract.actual_search_query)
+            if actual_query != query:
+                return CompletionDecision(True, False, "submitted_query_mismatch")
+            if contract.target_url:
+                origin_issue = cls._url_origin_issue(contract.target_url, current_url)
+                if origin_issue is not None:
+                    return CompletionDecision(
+                        True,
+                        False,
+                        f"search_origin_{origin_issue}",
+                    )
+            try:
+                current_host = urlsplit(str(current_url or "")).hostname or ""
+            except (TypeError, ValueError, UnicodeError):
+                current_host = ""
+            if contract.expected_host and not cls._host_matches(
+                contract.expected_host,
+                current_host,
+            ):
+                return CompletionDecision(True, False, "search_engine_host_mismatch")
+            url_has_query = cls._search_url_has_exact_query(current_url, contract.search_query)
             page_text = cls._page_observation_text(completion_observation)
-            page_has_query = query in cls._normalize_visible_text(page_text)
+            page_has_query = cls._evidence_is_visible(
+                contract.search_query,
+                completion_observation,
+                minimum_chars=1,
+            )
             url_changed = cls._full_url_key(contract.initial_url) != cls._full_url_key(current_url)
             result_signal = bool(_SEARCH_RESULT_SIGNAL.search(page_text))
             if url_has_query and url_changed:

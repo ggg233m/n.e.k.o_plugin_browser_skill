@@ -84,7 +84,7 @@ async def test_plugin_shutdown_closes_only_plugin_sessions() -> None:
 
 
 @pytest.mark.asyncio
-async def test_startup_preflight_runs_in_background_and_updates_status() -> None:
+async def test_startup_preflight_starts_on_persistent_command_loop() -> None:
     gate = asyncio.Event()
 
     class PreflightRuntime:
@@ -98,7 +98,10 @@ async def test_startup_preflight_runs_in_background_and_updates_status() -> None
     plugin = object.__new__(BrowserSkillPlugin)
     plugin._runtime = PreflightRuntime()
     plugin._startup_preflight_task = None
-    plugin._availability_cache = None
+    plugin._availability_cache = (
+        0.0,
+        Availability(ready=False, reasons=["PREFLIGHT_PENDING"]),
+    )
     plugin.logger = _Logger()
     plugin.statuses = []
 
@@ -106,7 +109,8 @@ async def test_startup_preflight_runs_in_background_and_updates_status() -> None
         self.statuses.append(payload)
 
     plugin.report_status = MethodType(report_status, plugin)
-    plugin._start_preflight_in_background()
+    assert plugin._startup_preflight_task is None
+    await plugin._on_command_loop_start()
 
     task = plugin._startup_preflight_task
     assert task is not None

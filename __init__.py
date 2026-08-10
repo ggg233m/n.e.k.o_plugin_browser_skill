@@ -598,6 +598,19 @@ class BrowserSkillPlugin(NekoPluginBase):
 
         task.add_done_callback(finished)
 
+    async def _on_command_loop_start(self) -> None:
+        """Start preflight only after the host enters its persistent event loop."""
+        task = getattr(self, "_startup_preflight_task", None)
+        if task is not None and not task.done():
+            return
+        cached = self._availability_cache
+        pending = bool(
+            cached is None
+            or "PREFLIGHT_PENDING" in getattr(cached[1], "reasons", [])
+        )
+        if pending:
+            self._start_preflight_in_background()
+
     async def _run_browser_task_fallback(self, **kwargs: Any):
         context = kwargs.get("_ctx") if isinstance(kwargs.get("_ctx"), dict) else {}
         conversation_id = _browser_session_key(context, scope=self._settings.session_scope)
@@ -836,7 +849,6 @@ class BrowserSkillPlugin(NekoPluginBase):
                 "reasons": availability.reasons,
             }
         )
-        self._start_preflight_in_background()
         self.logger.info(
             "BrowserSkill plugin started; background preflight pending: reasons={}",
             availability.reasons,

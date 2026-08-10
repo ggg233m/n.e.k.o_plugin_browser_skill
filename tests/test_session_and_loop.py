@@ -331,6 +331,8 @@ async def test_loop_navigates_verifies_and_keeps_reusable_session() -> None:
         planner=planner,
     )
     assert result.success and result.session_state == "kept"
+    assert result.completion_source == "model_evidence"
+    assert result.steps == 3
     assert result.session_decision_required is True
     assert result.current_url == "https://example.com/result"
     assert client.snapshot_counter >= 2
@@ -1115,6 +1117,74 @@ async def test_agent_failure_is_not_reconciled_when_navigation_target_does_not_m
 
 
 @pytest.mark.asyncio
+async def test_model_selected_navigation_url_is_not_promoted_to_expected_goal() -> None:
+    client = FakeBsk()
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        NavigateAction(action="navigate", url="https://www.bing.com/"),
+        DoneAction(action="done", summary="错误地声称已打开 GitHub"),
+        autofill_verified_done=False,
+    )
+    settings = RuntimeSettings(max_steps=2, session_keepalive_seconds=0)
+
+    result = await make_loop(client, sessions, settings).run(
+        instruction="打开 GitHub",
+        raw_request="打开 GitHub",
+        session=session,
+        planner=planner,
+    )
+
+    assert result.success is False
+    assert result.error is not None and result.error.code == "STEP_LIMIT"
+
+
+@pytest.mark.asyncio
+async def test_model_selected_search_query_does_not_replace_user_query() -> None:
+    client = FakeBsk()
+    client.url = "https://www.bing.com/"
+
+    async def search_snapshot(_session_id: str, **_kwargs: Any) -> dict[str, Any]:
+        text = (
+            'textbox "搜索" @e12'
+            if "search?" not in client.url
+            else 'textbox "搜索" value="222" @e4; link "222 - 搜索结果" @e9'
+        )
+        return {"text": text, "tab_id": 11}
+
+    async def submit_search(
+        _session_id: str,
+        key: str,
+        *,
+        target: str | None = None,
+    ) -> dict[str, Any]:
+        client.pressed.append((key, target))
+        client.url = "https://www.bing.com/search?q=222&form=QBRE"
+        return {}
+
+    client.snapshot = search_snapshot  # type: ignore[method-assign]
+    client.press = submit_search  # type: ignore[method-assign]
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        FillAction(action="fill", target="@e12", value="222", submit=True),
+        DoneAction(action="done", summary="错误地声称已搜索 111"),
+        autofill_verified_done=False,
+    )
+    settings = RuntimeSettings(max_steps=2, session_keepalive_seconds=0)
+
+    result = await make_loop(client, sessions, settings).run(
+        instruction="用 Bing 搜索 111",
+        raw_request="用 Bing 搜索 111",
+        session=session,
+        planner=planner,
+    )
+
+    assert result.success is False
+    assert result.error is not None and result.error.code == "STEP_LIMIT"
+
+
+@pytest.mark.asyncio
 async def test_compound_search_goal_does_not_finish_after_search_submission() -> None:
     client = FakeBsk()
     client.url = "https://www.bing.com/"
@@ -1192,6 +1262,97 @@ def test_page_route_key_ignores_queries_but_preserves_spa_routes() -> None:
     ) == AgentLoop._page_route_key(
         "https://github.com/example/project#installation"
     )
+
+
+@pytest.mark.parametrize(
+    "goal",
+    [
+        "打开 GitHub 并截图",
+        "打开视频然后播放",
+        "用 Bing 搜索 111 然后截图",
+        "搜索 111 并点击第一个结果",
+    ],
+)
+def test_compound_goals_never_use_navigation_or_search_fast_path(goal: str) -> None:
+    contract = AgentLoop._completion_contract(goal, goal, None)
+    assert contract.kind not in {"navigation", "search"}
+    assert contract.deterministic_allowed is False
+
+
+def test_navigation_url_verifier_preserves_security_and_route_boundaries() -> None:
+    assert AgentLoop._navigation_url_issue(
+        "https://example.com/",
+        "http://example.com/",
+    ) == "scheme_mismatch"
+    assert AgentLoop._navigation_url_issue(
+        "http://localhost:3000/",
+        "http://localhost:9999/",
+    ) == "port_mismatch"
+    assert AgentLoop._navigation_url_issue(
+        "https://example.com/#/wanted",
+        "https://example.com/#/wrong",
+    ) == "hash_route_mismatch"
+
+
+def test_search_url_requires_exact_known_query_parameter_value() -> None:
+    assert AgentLoop._search_url_has_exact_query(
+        "https://www.bing.com/search?q=111&form=QBRE",
+        "111",
+    )
+    assert not AgentLoop._search_url_has_exact_query(
+        "https://www.bing.com/search?q=222&form=QBRE1",
+        "1",
+    )
+    assert AgentLoop._search_url_has_exact_query(
+        "https://www.bing.com/search?q=C%2B%2B",
+        "C++",
+    )
+    assert not AgentLoop._search_url_has_exact_query(
+        "https://www.bing.com/search?q=C",
+        "C++",
+    )
+
+
+def test_search_verifier_enforces_requested_engine_host() -> None:
+    contract = AgentLoop._completion_contract(
+        "用 Bing 搜索 111",
+        "用 Bing 搜索 111",
+        None,
+    )
+    contract.initial_url = "https://www.bing.com/"
+    contract.actual_search_query = "111"
+    contract.search_submitted = True
+
+    decision = AgentLoop._deterministic_completion_decision(
+        contract,
+        current_url="https://www.google.com/search?q=111",
+        previous_observation='textbox "搜索" value="111"',
+        completion_observation='search results for 111; textbox "搜索" value="111"',
+    )
+
+    assert decision.accepted is False
+    assert decision.reason == "search_engine_host_mismatch"
+
+
+def test_search_verifier_preserves_start_url_origin_port() -> None:
+    contract = AgentLoop._completion_contract(
+        "搜索 111",
+        "搜索 111",
+        "http://localhost:3000/",
+    )
+    contract.initial_url = "http://localhost:3000/"
+    contract.actual_search_query = "111"
+    contract.search_submitted = True
+
+    decision = AgentLoop._deterministic_completion_decision(
+        contract,
+        current_url="http://localhost:9999/search?q=111",
+        previous_observation='textbox "搜索" value="111"',
+        completion_observation='search results for 111; textbox "搜索" value="111"',
+    )
+
+    assert decision.accepted is False
+    assert decision.reason == "search_origin_port_mismatch"
 
 
 def test_observation_hash_ignores_url_query_change_without_body_change() -> None:
