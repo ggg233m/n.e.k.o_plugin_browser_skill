@@ -123,6 +123,8 @@ def test_runtime_defaults_to_one_plugin_owned_agent_window() -> None:
     assert settings.release_control_when_idle is True
     assert settings.reuse_existing_window is True
     assert settings.allow_additional_agent_tabs is False
+    assert settings.planner_max_completion_tokens == 1200
+    assert settings.planner_correction_max_completion_tokens == 1600
     assert settings.snapshot_max_tokens == 8000
     assert settings.scroll_max_pages == 1
     assert settings.scroll_snapshot_max_tokens == 2000

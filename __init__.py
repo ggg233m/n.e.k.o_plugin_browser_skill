@@ -337,6 +337,7 @@ class BrowserSkillPlugin(NekoPluginBase):
         self._reconfigure_lock = asyncio.Lock()
         self._availability_cache: tuple[float, Any] | None = None
         self._availability_lock = asyncio.Lock()
+        self._startup_preflight_task: asyncio.Task[Any] | None = None
 
     def _debug(self, event: str, **fields: Any) -> None:
         if not bool(getattr(self._settings, "debug_logging", True)):
@@ -496,7 +497,8 @@ class BrowserSkillPlugin(NekoPluginBase):
                     "success", "status", "authoritative_outcome", "summary",
                     "details", "current_url",
                     "steps", "session_state", "continuation_available",
-                    "session_decision_required", "page", "recovery_recommended",
+                    "session_decision_required", "completion_source", "warnings",
+                    "page", "recovery_recommended",
                     "recovery_reason", "error",
                 ],
             )
@@ -506,12 +508,95 @@ class BrowserSkillPlugin(NekoPluginBase):
 
     async def _replace_runtime(self, settings: RuntimeSettings) -> None:
         async with self._reconfigure_lock:
+            await self._cancel_startup_preflight()
             await self._cancel_direct_tasks()
             await self._runtime.close()
             self._settings = settings
             self._runtime = BrowserSkillRuntime(settings=settings, logger=self._runtime_logger)
-            self._availability_cache = None
             self._configure_routing_surfaces()
+            availability = self._runtime.is_available()
+            availability.ready = False
+            if "PREFLIGHT_PENDING" not in availability.reasons:
+                availability.reasons.append("PREFLIGHT_PENDING")
+            self._availability_cache = (time.monotonic(), availability)
+            self.report_status(
+                {
+                    "status": "initializing",
+                    "provider": "browser-skill",
+                    "reasons": availability.reasons,
+                }
+            )
+            self._start_preflight_in_background()
+
+    async def _cancel_startup_preflight(self) -> None:
+        task = getattr(self, "_startup_preflight_task", None)
+        self._startup_preflight_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    def _start_preflight_in_background(self) -> None:
+        runtime = self._runtime
+
+        async def check() -> None:
+            try:
+                availability = await runtime.preflight()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if self._runtime is not runtime:
+                    return
+                availability = runtime.is_available()
+                availability.ready = False
+                availability.reasons.append("PREFLIGHT_FAILED")
+                self.report_status(
+                    {
+                        "status": "needs_setup",
+                        "provider": "browser-skill",
+                        "reasons": availability.reasons,
+                    }
+                )
+                self.logger.warning(
+                    "BrowserSkill background preflight failed: {}",
+                    type(exc).__name__,
+                )
+            if self._runtime is not runtime:
+                return
+            self._availability_cache = (time.monotonic(), availability)
+            self.report_status(
+                {
+                    "status": "ready" if availability.ready else "needs_setup",
+                    "provider": "browser-skill",
+                    "reasons": availability.reasons,
+                }
+            )
+            self.logger.info(
+                "BrowserSkill background preflight complete: ready={}, reasons={}",
+                availability.ready,
+                availability.reasons,
+            )
+
+        task = asyncio.create_task(check(), name="browser-skill-startup-preflight")
+        self._startup_preflight_task = task
+
+        def finished(done: asyncio.Task[Any]) -> None:
+            if self._startup_preflight_task is done:
+                self._startup_preflight_task = None
+            if done.cancelled():
+                return
+            try:
+                done.result()
+            except Exception as exc:
+                self.logger.exception(
+                    "BrowserSkill startup preflight task failed: {}",
+                    type(exc).__name__,
+                )
+
+        task.add_done_callback(finished)
 
     async def _run_browser_task_fallback(self, **kwargs: Any):
         context = kwargs.get("_ctx") if isinstance(kwargs.get("_ctx"), dict) else {}
@@ -634,6 +719,8 @@ class BrowserSkillPlugin(NekoPluginBase):
                 "session_state",
                 "continuation_available",
                 "session_decision_required",
+                "completion_source",
+                "warnings",
                 "recovery_recommended",
                 "recovery_reason",
                 "error",
@@ -737,23 +824,26 @@ class BrowserSkillPlugin(NekoPluginBase):
         self._settings = await self._load_effective_settings()
         self._runtime = BrowserSkillRuntime(settings=self._settings, logger=self._runtime_logger)
         self._configure_routing_surfaces()
-        availability = await self._runtime.preflight()
+        availability = self._runtime.is_available()
+        availability.ready = False
+        if "PREFLIGHT_PENDING" not in availability.reasons:
+            availability.reasons.append("PREFLIGHT_PENDING")
         self._availability_cache = (time.monotonic(), availability)
         self.report_status(
             {
-                "status": "ready" if availability.ready else "needs_setup",
+                "status": "initializing",
                 "provider": "browser-skill",
                 "reasons": availability.reasons,
             }
         )
+        self._start_preflight_in_background()
         self.logger.info(
-            "BrowserSkill plugin started: ready={}, reasons={}",
-            availability.ready,
+            "BrowserSkill plugin started; background preflight pending: reasons={}",
             availability.reasons,
         )
         return Ok(
             {
-                "status": "ready" if availability.ready else "needs_setup",
+                "status": "initializing",
                 "availability": availability.model_dump(mode="json"),
                 "routing_mode": self._effective_routing_mode,
             }
@@ -761,6 +851,7 @@ class BrowserSkillPlugin(NekoPluginBase):
 
     @lifecycle(id="shutdown")
     async def shutdown(self, **_: Any):
+        await self._cancel_startup_preflight()
         await self._cancel_direct_tasks()
         await self._runtime.close()
         self.logger.info("BrowserSkill plugin shutdown complete")
@@ -828,6 +919,8 @@ class BrowserSkillPlugin(NekoPluginBase):
             "session_state",
             "continuation_available",
             "session_decision_required",
+            "completion_source",
+            "warnings",
             "page",
             "recovery_recommended",
             "recovery_reason",
@@ -1189,15 +1282,17 @@ class BrowserSkillPlugin(NekoPluginBase):
         background_count = max(direct_count, int(runtime_active))
         task_in_flight = background_count > 0
         cached = self._availability_cache
+        preflight_task = getattr(self, "_startup_preflight_task", None)
+        preflight_in_flight = preflight_task is not None and not preflight_task.done()
         # The UI context itself is read every second, but spawning bsk version
         # and status processes at that rate would add noise and contend with
         # browser work. In-memory task/debug/control state remains real-time;
         # connection diagnostics refresh every five seconds or on manual refresh.
         cache_ttl = 5.0
-        needs_refresh = cached is None or (
+        needs_refresh = not preflight_in_flight and (cached is None or (
             not task_in_flight
             and (force_refresh or time.monotonic() - cached[0] >= cache_ttl)
-        )
+        ))
         if needs_refresh:
             # Multiple open panels can cross the TTL boundary together. Recheck
             # under one lock so they share one CLI diagnostic instead of each
@@ -1208,10 +1303,12 @@ class BrowserSkillPlugin(NekoPluginBase):
                     any(not task.done() for task in self._direct_tasks.values())
                     or bool(self._runtime.get_status().get("active"))
                 )
-                still_stale = cached is None or (
+                preflight_task = getattr(self, "_startup_preflight_task", None)
+                preflight_in_flight = preflight_task is not None and not preflight_task.done()
+                still_stale = not preflight_in_flight and (cached is None or (
                     not currently_active
                     and (force_refresh or time.monotonic() - cached[0] >= cache_ttl)
-                )
+                ))
                 if still_stale:
                     availability = await self._runtime.preflight()
                     self._availability_cache = (time.monotonic(), availability)

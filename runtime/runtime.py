@@ -106,7 +106,7 @@ class BrowserSkillRuntime:
             reasons.append("BSK_NOT_INSTALLED")
         cfg = self.config_manager.get_model_api_config("agent")
         if not cfg.get("model") or not cfg.get("base_url"):
-            reasons.append("AGENT_MODEL_UNAVAILABLE")
+            reasons.append("AGENT_MODEL_NOT_CONFIGURED")
         return Availability(ready=not reasons, reasons=reasons)
 
     async def preflight(self) -> Availability:
@@ -117,8 +117,8 @@ class BrowserSkillRuntime:
         cfg = self.config_manager.get_model_api_config("agent")
         if not cfg.get("model") or not cfg.get("base_url"):
             availability.ready = False
-            if "AGENT_MODEL_UNAVAILABLE" not in availability.reasons:
-                availability.reasons.append("AGENT_MODEL_UNAVAILABLE")
+            if "AGENT_MODEL_NOT_CONFIGURED" not in availability.reasons:
+                availability.reasons.append("AGENT_MODEL_NOT_CONFIGURED")
         return availability
 
     def cancel_running(self) -> None:
@@ -776,7 +776,7 @@ class BrowserSkillRuntime:
                 "BrowserSkill CLI 与扩展版本不匹配",
                 "将 bsk CLI 和浏览器扩展升级到相互兼容的版本。",
             ),
-            "AGENT_MODEL_UNAVAILABLE": (
+            "AGENT_MODEL_NOT_CONFIGURED": (
                 "Agent 模型尚未配置",
                 "请先在 N.E.K.O 模型设置中配置 Agent API。",
             ),
@@ -800,7 +800,7 @@ class BrowserSkillRuntime:
                 message=message,
                 hint=hint,
                 retryable=reason
-                not in {"BSK_NOT_INSTALLED", "BSK_BUNDLE_ERROR", "AGENT_MODEL_UNAVAILABLE"},
+                not in {"BSK_NOT_INSTALLED", "BSK_BUNDLE_ERROR", "AGENT_MODEL_NOT_CONFIGURED"},
             ),
         )
 

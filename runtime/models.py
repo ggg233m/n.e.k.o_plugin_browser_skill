@@ -35,6 +35,8 @@ class BrowserTaskResult(StrictModel):
     session_state: Literal["kept", "closed"] = "closed"
     continuation_available: bool = False
     session_decision_required: bool = False
+    completion_source: str = ""
+    warnings: list[str] = Field(default_factory=list)
     error: BrowserSkillErrorInfo | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -65,6 +67,8 @@ class RuntimeSettings(StrictModel):
     session_keepalive_seconds: float = Field(default=120.0, ge=0.0, le=240.0)
     release_control_when_idle: bool = True
     llm_timeout_seconds: float = Field(default=45.0, ge=5.0, le=180.0)
+    planner_max_completion_tokens: int = Field(default=1200, ge=256, le=4096)
+    planner_correction_max_completion_tokens: int = Field(default=1600, ge=256, le=8192)
     help_timeout_seconds: int = Field(default=300, ge=30, le=1800)
     snapshot_max_depth: int = Field(default=16, ge=4, le=64)
     snapshot_max_tokens: int = Field(default=8000, ge=500, le=32000)

@@ -1031,12 +1031,87 @@ async def test_search_result_completion_is_decided_by_agent() -> None:
     )
 
     assert result.success is True
-    assert result.steps == 3
+    assert result.steps == 2
     assert result.current_url == "https://www.bing.com/search?q=111&form=QBRE"
-    assert len(planner.observations) == 3
+    assert result.completion_source == "runtime_verifier"
+    assert len(planner.observations) == 2
     assert client.observe_count == 1
     assert client.fills == [("@e12", "111")]
     assert client.pressed == [("Enter", None)]
+
+
+@pytest.mark.asyncio
+async def test_completed_start_url_is_reconciled_when_next_agent_output_is_truncated() -> None:
+    class TruncatedPlanner:
+        total_usage = {
+            "input_tokens": 100,
+            "output_tokens": 1200,
+            "total_tokens": 1300,
+            "calls": 2,
+            "estimated_calls": 0,
+        }
+
+        async def decide(self, **_kwargs: Any) -> Any:
+            raise LoopFailure(
+                "AGENT_OUTPUT_TRUNCATED",
+                "Agent 动作输出在纠错后仍被 token 上限截断",
+                retryable=True,
+            )
+
+        async def close(self) -> None:
+            return None
+
+    client = FakeBsk()
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+
+    result = await make_loop(client, sessions).run(
+        instruction="打开 Bing",
+        raw_request="打开 Bing",
+        start_url="https://www.bing.com/",
+        session=session,
+        planner=TruncatedPlanner(),
+    )
+
+    assert result.success is True
+    assert result.current_url == "https://www.bing.com/"
+    assert result.completion_source == "runtime_reconciliation"
+    assert result.warnings == ["AGENT_OUTPUT_TRUNCATED"]
+    assert result.error is None
+
+
+@pytest.mark.asyncio
+async def test_agent_failure_is_not_reconciled_when_navigation_target_does_not_match() -> None:
+    class FailingPlanner:
+        async def decide(self, **_kwargs: Any) -> Any:
+            raise LoopFailure(
+                "AGENT_MODEL_TIMEOUT",
+                "Agent 模型请求超时",
+                retryable=True,
+            )
+
+        async def close(self) -> None:
+            return None
+
+    class RedirectedBsk(FakeBsk):
+        async def navigate(self, session_id: str, url: str, **kwargs: Any) -> dict[str, Any]:
+            self.url = "https://wrong.example/"
+            return {"final_url": self.url}
+
+    client = RedirectedBsk()
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+
+    with pytest.raises(LoopFailure) as caught:
+        await make_loop(client, sessions).run(
+            instruction="打开 Bing",
+            raw_request="打开 Bing",
+            start_url="https://www.bing.com/",
+            session=session,
+            planner=FailingPlanner(),
+        )
+
+    assert caught.value.code == "AGENT_MODEL_TIMEOUT"
 
 
 @pytest.mark.asyncio

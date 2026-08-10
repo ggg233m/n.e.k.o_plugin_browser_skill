@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qsl, unquote_plus, urljoin, urlsplit
 
 from utils.llm_client import create_chat_llm_async
 from utils.token_tracker import set_call_type
@@ -84,6 +84,29 @@ _CONTENT_ENTRY_INTENT = re.compile(
     r"(?:正文|文章|帖子|文档|项目|仓库|页面|结果|content|article|post|document|docs?|"
     r"project|repository|repo|result)"
     r")"
+)
+
+_SEARCH_INTENT = re.compile(
+    r"(?is)(?:搜索|搜一下|检索|查询|search\s+(?:for\s+)?|look\s+up)"
+)
+_WRITE_INTENT = re.compile(
+    r"(?is)(?:填写|提交|发送|发布|购买|下单|支付|上传|删除|修改|保存|"
+    r"fill|submit|send|publish|purchase|buy|pay|upload|delete|edit|save|sign\s*in|log\s*in)"
+)
+_CONTENT_INTENT = re.compile(
+    r"(?is)(?:正文|文章|帖子|文档|内容|总结|概括|提取|读取|分析|"
+    r"article|post|document|content|summari[sz]e|extract|read|analy[sz]e)"
+)
+_NAVIGATION_INTENT = re.compile(
+    r"(?is)(?:打开|访问|进入|前往|导航到|open|visit|go\s+to|navigate\s+to)"
+)
+_NAVIGATION_ERROR_PAGE = re.compile(
+    r"(?is)(?:ERR_[A-Z_]+|无法访问此网站|网页无法打开|找不到服务器|"
+    r"this\s+site\s+can(?:not|'t)\s+be\s+reached|server\s+not\s+found|"
+    r"page\s+not\s+found|connection\s+(?:failed|refused))"
+)
+_SEARCH_RESULT_SIGNAL = re.compile(
+    r"(?is)(?:搜索结果|相关结果|条结果|web\s+results?|search\s+results?|results?\s+for)"
 )
 
 _QR_AUTH_CHALLENGE = re.compile(
@@ -244,6 +267,7 @@ class Planner(Protocol):
         observation: str,
         history: list[str],
         verification_required: bool,
+        completion_contract: dict[str, Any] | None = None,
     ) -> AgentAction: ...
 
     async def close(self) -> None: ...
@@ -264,6 +288,22 @@ class LoopFailure(RuntimeError):
         self.hint = hint
         self.retryable = retryable
         self.status = status
+
+
+@dataclass
+class CompletionContract:
+    kind: str
+    target_url: str = ""
+    initial_url: str = ""
+    search_query: str = ""
+    search_submitted: bool = False
+
+
+@dataclass(frozen=True)
+class CompletionDecision:
+    applicable: bool
+    accepted: bool
+    reason: str
 
 
 def failure_result(error: LoopFailure, *, steps: int = 0) -> BrowserTaskResult:
@@ -299,6 +339,47 @@ def _response_format_unsupported(exc: Exception) -> bool:
             "unknown parameter",
             "unsupported parameter",
         )
+    )
+
+
+def _response_finish_reason(response: Any) -> str:
+    metadata = getattr(response, "response_metadata", None)
+    if not isinstance(metadata, dict):
+        return ""
+    return str(
+        metadata.get("finish_reason")
+        or metadata.get("stop_reason")
+        or metadata.get("stopReason")
+        or ""
+    ).strip().casefold()
+
+
+def _output_was_truncated(response: Any) -> bool:
+    return _response_finish_reason(response) in {
+        "length",
+        "max_tokens",
+        "max_output_tokens",
+        "model_length",
+    }
+
+
+def _planning_request_failure(exc: Exception, *, phase: str) -> LoopFailure:
+    if isinstance(exc, LoopFailure):
+        return exc
+    name = type(exc).__name__
+    text = str(exc).casefold()
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timeout" in name.casefold() or "timed out" in text:
+        return LoopFailure(
+            "AGENT_MODEL_TIMEOUT",
+            "Agent 模型请求超时",
+            hint=f"{phase}:{name}",
+            retryable=True,
+        )
+    return LoopFailure(
+        "AGENT_MODEL_REQUEST_FAILED",
+        "Agent 模型请求失败",
+        hint=f"{phase}:{name}",
+        retryable=True,
     )
 
 
@@ -435,7 +516,7 @@ class LLMPlanner:
         base_url = str(cfg.get("base_url") or "").strip()
         if not model or not base_url:
             raise LoopFailure(
-                "AGENT_MODEL_UNAVAILABLE",
+                "AGENT_MODEL_NOT_CONFIGURED",
                 "Agent 模型尚未配置",
                 hint="请先在 N.E.K.O 模型设置中配置 Agent API。",
             )
@@ -452,7 +533,7 @@ class LLMPlanner:
             api_key=cfg.get("api_key") or "EMPTY",
             temperature=0,
             max_retries=0,
-            max_completion_tokens=800,
+            max_completion_tokens=self.settings.planner_max_completion_tokens,
             timeout=self.settings.llm_timeout_seconds,
             provider_type=cfg.get("provider_type"),
         )
@@ -474,8 +555,14 @@ class LLMPlanner:
         observation: str,
         history: list[str],
         verification_required: bool,
+        completion_contract: dict[str, Any] | None = None,
     ) -> AgentAction:
         llm = await self._ensure_llm()
+        runtime_completion = completion_contract if isinstance(completion_contract, dict) else {}
+        deterministic_completion = str(runtime_completion.get("kind") or "") in {
+            "navigation",
+            "search",
+        }
         user_payload = {
             "execution_goal": instruction,
             "latest_user_request": raw_request or instruction,
@@ -501,12 +588,21 @@ class LLMPlanner:
                 ),
             },
             "verification_required": verification_required,
+            "runtime_completion_contract": runtime_completion,
             "completion_evidence_contract": (
-                "If action=done, copy visible_evidence as one contiguous exact substring from "
-                "latest_observation without paraphrasing, or copy a relevant current @eN into "
-                "visible_evidence_ref. Check the chosen quote/ref is literally present before "
-                "returning done. The runtime refreshes the page and accepts the first done when "
-                "that grounding remains visible."
+                (
+                    "For this navigation/search goal, trusted runtime URL and submission state are "
+                    "the authoritative completion evidence. Return a concise done action once that "
+                    "state is visible; visible_evidence is optional and must never be invented."
+                )
+                if deterministic_completion
+                else (
+                    "If action=done, copy visible_evidence as one contiguous exact substring from "
+                    "latest_observation without paraphrasing, or copy a relevant current @eN into "
+                    "visible_evidence_ref. Check the chosen quote/ref is literally present before "
+                    "returning done. The runtime refreshes the page and accepts the first done when "
+                    "that grounding remains visible."
+                )
             ),
             "recent_actions": history[-12:],
             "latest_observation": observation[:36000],
@@ -525,9 +621,36 @@ class LLMPlanner:
                 )
                 self._record_usage(response, messages, phase="plan")
                 raw_text = str(getattr(response, "content", "") or "")
-                action = parse_agent_action(raw_text)
+                self._log_output_state(
+                    response,
+                    raw_text,
+                    phase="plan",
+                    budget=self.settings.planner_max_completion_tokens,
+                    parse_state="received",
+                )
+                if _output_was_truncated(response):
+                    return await self._correct(
+                        messages,
+                        raw_text,
+                        ValueError("model output reached its token limit"),
+                        truncated=True,
+                    )
+                try:
+                    action = parse_agent_action(raw_text)
+                except Exception as exc:
+                    self._log_parse_failure(phase="plan", error=exc)
+                    return await self._correct(messages, raw_text, exc)
+                self._log_output_state(
+                    response,
+                    raw_text,
+                    phase="plan",
+                    budget=self.settings.planner_max_completion_tokens,
+                    parse_state="valid",
+                )
                 self._structured_capabilities[self._capability_key] = True
                 return action
+            except LoopFailure:
+                raise
             except Exception as exc:
                 if _response_format_unsupported(exc):
                     self._structured_mode = False
@@ -535,37 +658,162 @@ class LLMPlanner:
                 elif raw_text:
                     return await self._correct(messages, raw_text, exc)
                 else:
-                    raise
+                    raise _planning_request_failure(exc, phase="plan") from exc
 
         try:
             response = await llm.ainvoke(messages)
             self._record_usage(response, messages, phase="plan")
             raw_text = str(getattr(response, "content", "") or "")
-            return parse_agent_action(raw_text)
-        except Exception as exc:
-            if raw_text:
+            self._log_output_state(
+                response,
+                raw_text,
+                phase="plan",
+                budget=self.settings.planner_max_completion_tokens,
+                parse_state="received",
+            )
+            if _output_was_truncated(response):
+                return await self._correct(
+                    messages,
+                    raw_text,
+                    ValueError("model output reached its token limit"),
+                    truncated=True,
+                )
+            try:
+                action = parse_agent_action(raw_text)
+            except Exception as exc:
+                self._log_parse_failure(phase="plan", error=exc)
                 return await self._correct(messages, raw_text, exc)
-            raise
+            self._log_output_state(
+                response,
+                raw_text,
+                phase="plan",
+                budget=self.settings.planner_max_completion_tokens,
+                parse_state="valid",
+            )
+            return action
+        except Exception as exc:
+            if isinstance(exc, LoopFailure):
+                raise
+            raise _planning_request_failure(exc, phase="plan") from exc
+
+    def _log_output_state(
+        self,
+        response: Any,
+        raw_text: str,
+        *,
+        phase: str,
+        budget: int,
+        parse_state: str,
+    ) -> None:
+        if self.logger is None or not self.settings.debug_logging:
+            return
+        self.logger.debug(
+            "BrowserSkill agent output phase={} finish_reason={} output_chars={} budget={} parse_state={}",
+            phase,
+            _response_finish_reason(response) or "unknown",
+            len(raw_text),
+            budget,
+            parse_state,
+        )
+
+    def _log_parse_failure(self, *, phase: str, error: Exception) -> None:
+        if self.logger is None or not self.settings.debug_logging:
+            return
+        self.logger.debug(
+            "BrowserSkill agent output parse_failed phase={} error_type={}",
+            phase,
+            type(error).__name__,
+        )
+
+    @staticmethod
+    def _compact_correction_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        compacted = [dict(item) for item in messages]
+        if len(compacted) < 2:
+            return compacted
+        try:
+            payload = json.loads(str(compacted[1].get("content") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return compacted
+        if not isinstance(payload, dict):
+            return compacted
+        payload["latest_observation"] = str(payload.get("latest_observation") or "")[:12000]
+        recent = payload.get("recent_actions")
+        if isinstance(recent, list):
+            payload["recent_actions"] = recent[-6:]
+        compacted[1]["content"] = json.dumps(payload, ensure_ascii=False)
+        return compacted
 
     async def _correct(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         raw_text: str,
         error: Exception,
+        *,
+        truncated: bool = False,
     ) -> AgentAction:
         correction = (
-            "Your previous output failed schema validation. Return one corrected JSON action only. "
+            "Your previous output was truncated or failed schema validation. Return one complete "
+            "corrected JSON action only. "
             "Keep the exact execution_goal and controller_contract unchanged while correcting shape. "
-            f"Validation error: {type(error).__name__}. Previous output: {raw_text[:4000]}"
+            f"Validation error: {type(error).__name__}. Previous output: {raw_text[:2000]}"
         )
+        compacted = self._compact_correction_messages(messages)
+        correction_messages = [*compacted, {"role": "user", "content": correction}]
         set_call_type("agent_browser_skill")
-        response = await self._llm.ainvoke([*messages, {"role": "user", "content": correction}])
+        try:
+            response = await self._llm.ainvoke(
+                correction_messages,
+                max_completion_tokens=self.settings.planner_correction_max_completion_tokens,
+            )
+        except Exception as exc:
+            raise _planning_request_failure(exc, phase="correction") from exc
         self._record_usage(
             response,
-            [*messages, {"role": "user", "content": correction}],
+            correction_messages,
             phase="correction",
         )
-        return parse_agent_action(str(getattr(response, "content", "") or ""))
+        corrected_text = str(getattr(response, "content", "") or "")
+        self._log_output_state(
+            response,
+            corrected_text,
+            phase="correction",
+            budget=self.settings.planner_correction_max_completion_tokens,
+            parse_state="received",
+        )
+        if _output_was_truncated(response):
+            raise LoopFailure(
+                "AGENT_OUTPUT_TRUNCATED",
+                "Agent 动作输出在纠错后仍被 token 上限截断",
+                hint=(
+                    f"finish_reason={_response_finish_reason(response) or 'unknown'}; "
+                    f"budget={self.settings.planner_correction_max_completion_tokens}"
+                ),
+                retryable=True,
+            )
+        try:
+            action = parse_agent_action(corrected_text)
+        except Exception as exc:
+            self._log_parse_failure(phase="correction", error=exc)
+            code = "AGENT_OUTPUT_TRUNCATED" if truncated else "AGENT_ACTION_INVALID"
+            message = (
+                "Agent 动作输出被截断且无法自动修复"
+                if truncated
+                else "Agent 返回的动作 JSON 无法通过 schema 校验"
+            )
+            raise LoopFailure(
+                code,
+                message,
+                hint=f"correction:{type(exc).__name__}",
+                retryable=True,
+            ) from exc
+        self._log_output_state(
+            response,
+            corrected_text,
+            phase="correction",
+            budget=self.settings.planner_correction_max_completion_tokens,
+            parse_state="valid",
+        )
+        return action
 
     async def close(self) -> None:
         llm, self._llm = self._llm, None
@@ -763,6 +1011,7 @@ class AgentLoop:
         stale_failures = 0
         alternate_recovery_used = False
         viewport = ViewportPosition()
+        completion_contract = self._completion_contract(instruction, raw_request, start_url)
 
         async def apply_steering() -> bool:
             nonlocal instruction, raw_request, observation, observation_level, current_url
@@ -771,7 +1020,7 @@ class AgentLoop:
             nonlocal last_mutation_state_hash, stagnation_recovery_used
             nonlocal completion_rejection_count, completion_rejection_hash
             nonlocal completion_rejection_url
-            nonlocal replannable_policy_rejections
+            nonlocal replannable_policy_rejections, completion_contract
             if control is None:
                 return False
             updates = control.consume_updates()
@@ -817,6 +1066,7 @@ class AgentLoop:
             completion_rejection_hash = ""
             completion_rejection_url = ""
             replannable_policy_rejections = 0
+            completion_contract = self._completion_contract(instruction, raw_request, None)
             await self._progress(progress, "steering", "已接收新要求，正在重新观察和规划", steps)
             tabs = await self.client.tab_list(session.bsk_session_id, scope="agent")
             refreshed_url, refreshed_tab_id = self._active_tab_state(tabs)
@@ -830,6 +1080,7 @@ class AgentLoop:
                 session.current_title = refreshed_title
             observation = await self._snapshot(session, current_url)
             observation_level = 1
+            completion_contract.initial_url = current_url
             control.update_url(self._observation_url(observation))
             return True
 
@@ -880,6 +1131,107 @@ class AgentLoop:
             completion_rejection_hash = ""
             completion_rejection_url = ""
 
+        async def complete_success(
+            *,
+            summary: str,
+            details: str,
+            completion_source: str,
+            warnings: list[str] | None = None,
+            reported_url: str = "",
+        ) -> BrowserTaskResult:
+            nonlocal finalized
+            disposition = (
+                "close_session" if final_session_action == "close" else "keep_session"
+            )
+            if not session.reusable:
+                disposition = "close_session"
+            session_state = await self._finalize_session(session, disposition)
+            decision_required = final_session_action == "defer" and session_state == "kept"
+            finalized = True
+            return BrowserTaskResult(
+                success=True,
+                status="completed",
+                summary=summary,
+                details=details,
+                current_url=current_url or reported_url,
+                steps=steps,
+                session_state=session_state,
+                session_decision_required=decision_required,
+                completion_source=completion_source,
+                warnings=list(warnings or []),
+            )
+
+        async def reconcile_planner_failure(error: LoopFailure) -> BrowserTaskResult | None:
+            nonlocal current_url, observation, observation_level
+            if error.code not in {
+                "AGENT_MODEL_NOT_CONFIGURED",
+                "AGENT_MODEL_TIMEOUT",
+                "AGENT_MODEL_REQUEST_FAILED",
+                "AGENT_OUTPUT_TRUNCATED",
+                "AGENT_ACTION_INVALID",
+            }:
+                return None
+            if completion_contract.kind not in {"navigation", "search"}:
+                return None
+            if await self._additional_tab_completion_issue(
+                session,
+                instruction=raw_request or instruction,
+            ) is not None:
+                return None
+            try:
+                refreshed_tabs = await self.client.tab_list(
+                    session.bsk_session_id,
+                    scope="agent",
+                )
+                refreshed_url, refreshed_tab_id = self._active_tab_state(refreshed_tabs)
+                if refreshed_url:
+                    current_url = refreshed_url
+                    session.current_url = refreshed_url
+                if refreshed_tab_id is not None:
+                    session.current_tab_id = refreshed_tab_id
+                completion_observation = await self._completion_observation(session, current_url)
+            except Exception as exc:
+                if self.logger is not None and self.settings.debug_logging:
+                    self.logger.debug(
+                        "BrowserSkill planner failure reconciliation skipped code={} reason={}",
+                        error.code,
+                        type(exc).__name__,
+                    )
+                return None
+            decision = self._deterministic_completion_decision(
+                completion_contract,
+                current_url=current_url,
+                previous_observation=observation,
+                completion_observation=completion_observation,
+            )
+            observation = completion_observation
+            observation_level = 2
+            if self.logger is not None and self.settings.debug_logging:
+                self.logger.debug(
+                    "BrowserSkill planner failure reconciliation accepted={} code={} kind={} reason={}",
+                    decision.accepted,
+                    error.code,
+                    completion_contract.kind,
+                    decision.reason,
+                )
+            if not decision.accepted:
+                return None
+            if control is not None:
+                control.update_url(current_url)
+            return await complete_success(
+                summary=(
+                    "浏览器目标已完成，并已由运行时状态复核"
+                    if language == "zh"
+                    else "The browser goal completed and was verified from runtime state"
+                ),
+                details=(
+                    f"Agent 后续规划发生 {error.code}，但可信浏览器状态已满足"
+                    f"{completion_contract.kind}目标；未将模型错误误报为任务失败。"
+                ),
+                completion_source="runtime_reconciliation",
+                warnings=[error.code],
+            )
+
         try:
             await self._progress(progress, "observing", "正在读取浏览器页面", 0)
             tabs = await self.client.tab_list(session.bsk_session_id, scope="agent")
@@ -892,11 +1244,15 @@ class AgentLoop:
                 validate_action(NavigateAction(action="navigate", url=start_url))
                 nav = await self.client.navigate(session.bsk_session_id, start_url)
                 current_url = self._extract_url(nav) or current_url
+                session.current_url = current_url
+                if control is not None:
+                    control.update_url(current_url)
                 viewport.reset(at_top=True, reason="start_url_navigation")
             else:
                 viewport.reset(at_top=False, reason="initial_position_unknown")
             observation = await self._snapshot(session, current_url)
             observation_level = 1
+            completion_contract.initial_url = current_url
 
             for steps in range(1, self.settings.max_steps + 1):
                 self._check_timeout(start)
@@ -957,6 +1313,11 @@ class AgentLoop:
                         observation=viewport.decorate(observation),
                         history=history,
                         verification_required=verification_required,
+                        completion_contract={
+                            "kind": completion_contract.kind,
+                            "target_known": bool(completion_contract.target_url),
+                            "search_submitted": completion_contract.search_submitted,
+                        },
                     )
                     planner_usage = getattr(planner, "total_usage", None)
                     if isinstance(planner_usage, dict):
@@ -1000,19 +1361,33 @@ class AgentLoop:
                             action.action,
                             max(0, int((time.monotonic() - planning_started) * 1000)),
                         )
-                except LoopFailure:
+                except LoopFailure as exc:
+                    if control is not None and control.pending_count:
+                        await apply_steering()
+                        continue
+                    reconciled = await reconcile_planner_failure(exc)
+                    if reconciled is not None:
+                        return reconciled
                     raise
                 except PolicyViolation as exc:
                     raise LoopFailure(exc.code, str(exc)) from exc
                 except Exception as exc:
-                    raise LoopFailure(
-                        "AGENT_MODEL_UNAVAILABLE",
-                        "Agent 模型未能生成有效的浏览器动作",
-                        hint=type(exc).__name__,
+                    if control is not None and control.pending_count:
+                        await apply_steering()
+                        continue
+                    failure = LoopFailure(
+                        "AGENT_ACTION_INVALID",
+                        "Agent 未能生成有效的浏览器动作",
+                        hint=f"planner:{type(exc).__name__}",
                         retryable=True,
-                    ) from exc
+                    )
+                    reconciled = await reconcile_planner_failure(failure)
+                    if reconciled is not None:
+                        return reconciled
+                    raise failure from exc
 
                 if isinstance(action, DoneAction):
+                    completion_source = "model_evidence"
                     additional_tab_issue = await self._additional_tab_completion_issue(
                         session,
                         instruction=raw_request or instruction,
@@ -1062,15 +1437,25 @@ class AgentLoop:
                             session,
                             current_url,
                         )
-                        fast_path_issue = self._completion_fast_path_issue(
-                            action,
+                        completion_decision = self._deterministic_completion_decision(
+                            completion_contract,
+                            current_url=current_url,
                             previous_observation=previous_observation,
                             completion_observation=completion_observation,
-                            primary_content_required=self._requires_primary_content_view(
-                                instruction,
-                                raw_request,
-                            ),
                         )
+                        if completion_decision.accepted:
+                            fast_path_issue = None
+                            completion_source = "runtime_verifier"
+                        else:
+                            fast_path_issue = self._completion_fast_path_issue(
+                                action,
+                                previous_observation=previous_observation,
+                                completion_observation=completion_observation,
+                                primary_content_required=self._requires_primary_content_view(
+                                    instruction,
+                                    raw_request,
+                                ),
+                            )
                         observation = completion_observation
                         observation_level = 2
                         if self.logger is not None and self.settings.debug_logging:
@@ -1078,7 +1463,11 @@ class AgentLoop:
                                 "BrowserSkill completion fast_path={} step={} reason={}",
                                 fast_path_issue is None,
                                 steps,
-                                fast_path_issue or "stable_visible_evidence",
+                                (
+                                    completion_decision.reason
+                                    if completion_decision.accepted
+                                    else fast_path_issue or "stable_visible_evidence"
+                                ),
                             )
                         if fast_path_issue is not None:
                             rejected_done_count, _ = record_completion_rejection()
@@ -1155,27 +1544,11 @@ class AgentLoop:
                                 )
                             )
                             continue
-                    disposition = (
-                        "close_session"
-                        if final_session_action == "close"
-                        else "keep_session"
-                    )
-                    if not session.reusable:
-                        disposition = "close_session"
-                    session_state = await self._finalize_session(session, disposition)
-                    decision_required = (
-                        final_session_action == "defer" and session_state == "kept"
-                    )
-                    finalized = True
-                    return BrowserTaskResult(
-                        success=True,
-                        status="completed",
+                    return await complete_success(
                         summary=action.summary,
                         details=action.details,
-                        current_url=action.current_url or current_url,
-                        steps=steps,
-                        session_state=session_state,
-                        session_decision_required=decision_required,
+                        reported_url=action.current_url,
+                        completion_source=completion_source,
                     )
 
                 if isinstance(action, TabCreateAction):
@@ -1287,6 +1660,11 @@ class AgentLoop:
                     )
 
                 verification_required = False
+                search_fill_action = bool(
+                    completion_contract.kind == "search"
+                    and isinstance(action, FillAction)
+                    and is_search_fill(action, observation)
+                )
                 before_hash = self._observation_hash(observation)
                 previous_url = current_url
                 previous_tab_id = session.current_tab_id
@@ -1501,6 +1879,18 @@ class AgentLoop:
                     viewport.mark_unknown("enter_may_have_navigated")
                 stale_failures = 0
                 history.append(result_text)
+                if completion_contract.kind == "navigation" and isinstance(action, NavigateAction):
+                    completion_contract.target_url = result_url or action.url
+                if search_fill_action and isinstance(action, FillAction):
+                    completion_contract.search_query = action.value
+                    completion_contract.search_submitted = action.submit
+                elif (
+                    completion_contract.kind == "search"
+                    and completion_contract.search_query
+                    and isinstance(action, PressAction)
+                    and action.key.casefold() in {"enter", "return"}
+                ):
+                    completion_contract.search_submitted = True
                 if explicit_observation is not None:
                     observation = self._with_url(explicit_observation, current_url)
                     observation_level = level
@@ -2550,6 +2940,113 @@ class AgentLoop:
     def _requires_primary_content_view(instruction: str, raw_request: str) -> bool:
         goal = " ".join((str(instruction or ""), str(raw_request or "")))
         return bool(_CONTENT_ENTRY_INTENT.search(goal))
+
+    @classmethod
+    def _completion_contract(
+        cls,
+        instruction: str,
+        raw_request: str,
+        start_url: str | None,
+    ) -> CompletionContract:
+        goal = str(raw_request or instruction or "").strip()
+        if _CONTENT_ENTRY_INTENT.search(goal):
+            kind = "content"
+        elif _SEARCH_INTENT.search(goal):
+            kind = "search"
+        elif _WRITE_INTENT.search(goal):
+            kind = "mutation"
+        elif _CONTENT_INTENT.search(goal):
+            kind = "content"
+        elif _NAVIGATION_INTENT.search(goal):
+            kind = "navigation"
+        else:
+            kind = "generic"
+        return CompletionContract(
+            kind=kind,
+            target_url=str(start_url or "").strip() if kind == "navigation" else "",
+            search_query=cls._search_query_from_goal(goal) if kind == "search" else "",
+        )
+
+    @staticmethod
+    def _search_query_from_goal(goal: str) -> str:
+        patterns = (
+            r"(?is)(?:搜索|搜一下|检索|查询)\s*[\"'“‘]?(.+?)[\"'”’]?\s*$",
+            r"(?is)(?:search\s+(?:for\s+)?|look\s+up\s+)[\"']?(.+?)[\"']?\s*$",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, str(goal or ""))
+            if match:
+                return match.group(1).strip().strip("。.!！?？")[:2000]
+        return ""
+
+    @staticmethod
+    def _canonical_host(value: str) -> str:
+        host = str(value or "").strip().rstrip(".").casefold()
+        return host[4:] if host.startswith("www.") else host
+
+    @classmethod
+    def _navigation_url_issue(cls, expected_url: str, current_url: str) -> str | None:
+        try:
+            expected = urlsplit(str(expected_url or "").strip())
+            current = urlsplit(str(current_url or "").strip())
+            if expected.scheme.casefold() not in {"http", "https"} or not expected.hostname:
+                return "expected_url_invalid"
+            if current.scheme.casefold() not in {"http", "https"} or not current.hostname:
+                return "current_url_not_http"
+            if cls._canonical_host(expected.hostname) != cls._canonical_host(current.hostname):
+                return "host_mismatch"
+            expected_path = expected.path or "/"
+            current_path = current.path or "/"
+            if expected_path != "/" and expected_path.rstrip("/") != current_path.rstrip("/"):
+                return "path_mismatch"
+            expected_query = dict(parse_qsl(expected.query, keep_blank_values=True))
+            current_query = dict(parse_qsl(current.query, keep_blank_values=True))
+            for key, value in expected_query.items():
+                if current_query.get(key) != value:
+                    return "query_mismatch"
+        except (TypeError, ValueError, UnicodeError):
+            return "url_parse_failed"
+        return None
+
+    @classmethod
+    def _deterministic_completion_decision(
+        cls,
+        contract: CompletionContract,
+        *,
+        current_url: str,
+        previous_observation: str,
+        completion_observation: str,
+    ) -> CompletionDecision:
+        if contract.kind == "navigation":
+            if not contract.target_url:
+                return CompletionDecision(True, False, "navigation_target_unknown")
+            issue = cls._navigation_url_issue(contract.target_url, current_url)
+            if issue is not None:
+                return CompletionDecision(True, False, issue)
+            page_text = cls._page_observation_text(completion_observation)
+            if _NAVIGATION_ERROR_PAGE.search(page_text):
+                return CompletionDecision(True, False, "browser_error_page_visible")
+            return CompletionDecision(True, True, "trusted_url_matches_navigation_target")
+
+        if contract.kind == "search":
+            if not contract.search_submitted:
+                return CompletionDecision(True, False, "search_not_submitted")
+            query = cls._normalize_visible_text(contract.search_query)
+            if not query:
+                return CompletionDecision(True, False, "search_query_unknown")
+            decoded_url = unquote_plus(str(current_url or ""))
+            url_has_query = query in cls._normalize_visible_text(decoded_url)
+            page_text = cls._page_observation_text(completion_observation)
+            page_has_query = query in cls._normalize_visible_text(page_text)
+            url_changed = cls._full_url_key(contract.initial_url) != cls._full_url_key(current_url)
+            result_signal = bool(_SEARCH_RESULT_SIGNAL.search(page_text))
+            if url_has_query and url_changed:
+                return CompletionDecision(True, True, "submitted_query_present_in_result_url")
+            if page_has_query and result_signal:
+                return CompletionDecision(True, True, "submitted_query_present_in_search_results")
+            return CompletionDecision(True, False, "search_results_not_confirmed")
+
+        return CompletionDecision(False, False, "model_evidence_required")
 
     async def _finalize_session(
         self,

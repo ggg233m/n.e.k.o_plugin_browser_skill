@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
 
 import plugin.plugins.browser_skill.runtime.agent_loop as agent_loop_module
 import pytest
-from plugin.plugins.browser_skill.runtime.agent_loop import LLMPlanner
+from plugin.plugins.browser_skill.runtime.agent_loop import LLMPlanner, LoopFailure
 from plugin.plugins.browser_skill.runtime.models import NavigateAction, RuntimeSettings
 
 
@@ -54,6 +55,7 @@ async def test_structured_output_capability_fallback_is_cached_by_endpoint(
 
     async def factory(*args: Any, **kwargs: Any) -> FakeLLM:
         llm = FakeLLM()
+        llm.factory_kwargs = kwargs  # type: ignore[attr-defined]
         created.append(llm)
         return llm
 
@@ -102,6 +104,7 @@ async def test_structured_output_capability_fallback_is_cached_by_endpoint(
 
     assert isinstance(first_action, NavigateAction)
     assert isinstance(second_action, NavigateAction)
+    assert created[0].factory_kwargs["max_completion_tokens"] == 1200  # type: ignore[attr-defined]
     assert created[0].calls == [{"response_format": {"type": "json_object"}}, {}]
     assert created[1].calls == [{}]
     payload = json.loads(created[0].messages[0][1]["content"])
@@ -115,3 +118,127 @@ async def test_structured_output_capability_fallback_is_cached_by_endpoint(
     assert "without paraphrasing" in payload["completion_evidence_contract"]
     assert "visible_evidence_ref" in payload["completion_evidence_contract"]
     assert "original_user_request" not in payload
+
+
+class SequencedLLM:
+    def __init__(self, *responses: Any) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict[str, Any]] = []
+        self.messages: list[Any] = []
+
+    async def ainvoke(self, messages: Any, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        self.messages.append(messages)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class ModelResponse:
+    def __init__(self, content: str, finish_reason: str = "stop") -> None:
+        self.content = content
+        self.response_metadata = {"finish_reason": finish_reason}
+        self.usage_metadata = {
+            "input_tokens": 10,
+            "output_tokens": 10,
+            "total_tokens": 20,
+        }
+
+
+def planner_with_llm(llm: Any, **settings: Any) -> LLMPlanner:
+    planner = LLMPlanner(
+        config_manager=Config(),
+        settings=RuntimeSettings(**settings),
+        prompts_dir=Path(__file__).parent.parent / "prompts",
+        language="en",
+    )
+    planner._llm = llm
+    planner._structured_mode = False
+    return planner
+
+
+@pytest.mark.asyncio
+async def test_truncated_plan_gets_one_compact_larger_budget_correction() -> None:
+    llm = SequencedLLM(
+        ModelResponse('{"action":"navigate","url":"https://exa', "length"),
+        ModelResponse('{"action":"navigate","url":"https://example.com"}'),
+    )
+    planner = planner_with_llm(
+        llm,
+        planner_max_completion_tokens=900,
+        planner_correction_max_completion_tokens=1700,
+    )
+
+    action = await planner.decide(
+        instruction="Open Example",
+        raw_request="Open Example",
+        observation="x" * 30000,
+        history=[f"step {index}" for index in range(12)],
+        verification_required=False,
+    )
+
+    assert isinstance(action, NavigateAction)
+    assert llm.calls == [{}, {"max_completion_tokens": 1700}]
+    correction_payload = json.loads(llm.messages[1][1]["content"])
+    assert len(correction_payload["latest_observation"]) == 12000
+    assert correction_payload["recent_actions"] == [f"step {index}" for index in range(6, 12)]
+    assert planner.total_usage["calls"] == 2
+
+
+@pytest.mark.asyncio
+async def test_second_truncation_has_specific_error_code_and_no_third_retry() -> None:
+    llm = SequencedLLM(
+        ModelResponse('{"action":"navigate"', "length"),
+        ModelResponse('{"action":"navigate"', "max_tokens"),
+    )
+    planner = planner_with_llm(llm)
+
+    with pytest.raises(LoopFailure) as caught:
+        await planner.decide(
+            instruction="Open Example",
+            raw_request="Open Example",
+            observation="Current URL: about:blank",
+            history=[],
+            verification_required=False,
+        )
+
+    assert caught.value.code == "AGENT_OUTPUT_TRUNCATED"
+    assert len(llm.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_agent_request_timeout_has_specific_error_code() -> None:
+    planner = planner_with_llm(SequencedLLM(asyncio.TimeoutError()))
+
+    with pytest.raises(LoopFailure) as caught:
+        await planner.decide(
+            instruction="Open Example",
+            raw_request="Open Example",
+            observation="Current URL: about:blank",
+            history=[],
+            verification_required=False,
+        )
+
+    assert caught.value.code == "AGENT_MODEL_TIMEOUT"
+
+
+@pytest.mark.asyncio
+async def test_invalid_action_after_one_correction_has_specific_error_code() -> None:
+    llm = SequencedLLM(
+        ModelResponse('{"action":"unknown"}'),
+        ModelResponse('{"still":"not an action"}'),
+    )
+    planner = planner_with_llm(llm)
+
+    with pytest.raises(LoopFailure) as caught:
+        await planner.decide(
+            instruction="Open Example",
+            raw_request="Open Example",
+            observation="Current URL: about:blank",
+            history=[],
+            verification_required=False,
+        )
+
+    assert caught.value.code == "AGENT_ACTION_INVALID"
+    assert len(llm.calls) == 2

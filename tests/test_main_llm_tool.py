@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 from plugin.plugins.browser_skill import BrowserSkillPlugin, _steer_reply_payload
-from plugin.plugins.browser_skill.runtime.models import BrowserTaskResult
+from plugin.plugins.browser_skill.runtime.models import Availability, BrowserTaskResult
 from plugin.sdk.plugin.llm_tool import collect_llm_tool_methods
 
 
@@ -81,6 +81,43 @@ async def test_plugin_shutdown_closes_only_plugin_sessions() -> None:
 
     assert plugin._runtime.close_calls == [None]
     assert plugin._runtime.events == ["close_sessions"]
+
+
+@pytest.mark.asyncio
+async def test_startup_preflight_runs_in_background_and_updates_status() -> None:
+    gate = asyncio.Event()
+
+    class PreflightRuntime:
+        async def preflight(self) -> Availability:
+            await gate.wait()
+            return Availability(ready=True, reasons=[], browsers=[])
+
+        def is_available(self) -> Availability:
+            return Availability(ready=True, reasons=[])
+
+    plugin = object.__new__(BrowserSkillPlugin)
+    plugin._runtime = PreflightRuntime()
+    plugin._startup_preflight_task = None
+    plugin._availability_cache = None
+    plugin.logger = _Logger()
+    plugin.statuses = []
+
+    def report_status(self: BrowserSkillPlugin, payload: dict[str, Any]) -> None:
+        self.statuses.append(payload)
+
+    plugin.report_status = MethodType(report_status, plugin)
+    plugin._start_preflight_in_background()
+
+    task = plugin._startup_preflight_task
+    assert task is not None
+    await asyncio.sleep(0)
+    assert task.done() is False
+    gate.set()
+    await task
+
+    assert plugin._availability_cache is not None
+    assert plugin._availability_cache[1].ready is True
+    assert plugin.statuses[-1]["status"] == "ready"
 
 
 def test_auto_routing_adds_fallback_for_uncertain_native_routes() -> None:
