@@ -163,7 +163,11 @@ class ScreenshotAction(BaseAction):
 
 
 class TargetAction(BaseAction):
-    target: str = Field(min_length=1, max_length=512)
+    target: str = Field(
+        min_length=1,
+        max_length=512,
+        description="Exact @eN ref from the latest observation; CSS selectors are not allowed.",
+    )
 
     @field_validator("target")
     @classmethod

@@ -7,6 +7,7 @@ from plugin.plugins.browser_skill.runtime.models import (
     ClickAction,
     FillAction,
     NavigateAction,
+    PressAction,
     RuntimeSettings,
     ScrollAction,
     action_schema_json,
@@ -15,8 +16,11 @@ from plugin.plugins.browser_skill.runtime.models import (
 from plugin.plugins.browser_skill.runtime.policy import (
     PolicyViolation,
     additional_agent_tab_requested,
+    http_link_requires_confirmation,
     is_search_fill,
     is_sensitive_fill,
+    observed_controls_match,
+    observed_target_control,
     requested_agent_tab_count,
     requires_critical_confirmation,
     requires_persistent_session,
@@ -82,11 +86,180 @@ def test_fill_submit_is_limited_to_observed_search_fields() -> None:
     action = FillAction(action="fill", target="@e7", value="cats", submit=True)
     assert is_search_fill(action, 'textbox "搜索" @e7')
     assert not is_search_fill(action, 'textbox "昵称" @e7')
+    assert not is_search_fill(
+        FillAction(
+            action="fill",
+            target="@e7",
+            value="cats",
+            submit=True,
+            reason="Search from this field",
+        ),
+        'textbox "昵称" @e7',
+    )
 
 
 def test_critical_click_requires_confirmation() -> None:
     action = ClickAction(action="click", target="@e9", reason="提交订单")
     assert requires_critical_confirmation(action, "购买商品", 'button "提交订单" @e9')
+    assert not requires_critical_confirmation(
+        ClickAction(action="click", target="@e13", reason="Submit search"),
+        "Search BrowserSkill",
+        'button "Search" @e13',
+    )
+    assert requires_critical_confirmation(
+        ClickAction(action="click", target="@e13"),
+        "Search BrowserSkill",
+        'textbox "Search" @e12\nbutton "Submit" @e13',
+    )
+    assert requires_critical_confirmation(
+        ClickAction(action="click", target="@e13"),
+        "Search BrowserSkill",
+        'textbox "Search" @e12\ntextbox "Cardholder" @e20\nbutton "Submit" @e13',
+    )
+    assert not requires_critical_confirmation(
+        ClickAction(action="click", target="@e13", reason="提交订单"),
+        "搜索 BrowserSkill",
+        'button "搜索" @e13',
+    )
+    assert requires_critical_confirmation(
+        ClickAction(action="click", target="@e9"),
+        "购买这个商品",
+        'button "确认" @e9',
+    )
+
+
+def test_observed_ref_matching_does_not_confuse_numeric_prefixes() -> None:
+    observation = 'textbox "Search" @e10; button "Delete" @e1'
+    assert observed_target_control("@e1", observation) == 'button "Delete" @e1'
+    assert observed_target_control("@e10", observation) == 'textbox "Search" @e10'
+    assert requires_critical_confirmation(
+        ClickAction(action="click", target="@e1"),
+        "删除这条内容",
+        observation,
+    )
+    assert not requires_critical_confirmation(
+        ClickAction(action="click", target="button[data-action=delete]"),
+        "删除这条内容",
+        observation,
+    )
+
+
+def test_confirmed_control_matching_uses_semantic_identity() -> None:
+    before = 'button "Submit order" [focused] @e9'
+    assert observed_controls_match(
+        "@e9",
+        before,
+        'button "Submit order" [disabled] @e9',
+    )
+    assert not observed_controls_match(
+        "@e9",
+        before,
+        'button "Delete account" @e9',
+    )
+
+
+def test_http_link_confirmation_preserves_document_navigation_exemption() -> None:
+    assert not http_link_requires_confirmation(
+        ClickAction(action="click", target="@e4"),
+        "打开删除账户的帮助文档",
+        'link "Delete account documentation" @e4',
+        "https://example.com/docs/delete-account",
+    )
+    assert http_link_requires_confirmation(
+        ClickAction(action="click", target="@e4"),
+        "删除这个项目",
+        'link "Delete" @e4',
+        "https://example.com/items/delete",
+    )
+    assert http_link_requires_confirmation(
+        ClickAction(action="click", target="@e4"),
+        "退出登录",
+        'link "Logout" @e4',
+        "https://example.com/account?action=logout",
+    )
+
+
+def test_targetless_enter_confirms_only_with_clear_consequential_control() -> None:
+    action = PressAction(action="press", key="Enter")
+    assert requires_critical_confirmation(
+        action,
+        "发送这条消息",
+        'textbox "给 DeepSeek 发送消息" @e111',
+    )
+    assert not requires_critical_confirmation(
+        action,
+        "搜索 BrowserSkill",
+        'textbox "搜索" @e12',
+    )
+    assert not requires_critical_confirmation(
+        PressAction(action="press", key="Enter", reason="Submit the search query"),
+        "Search BrowserSkill",
+        'textbox "Search" @e12',
+    )
+    assert not requires_critical_confirmation(
+        action,
+        "阅读购买政策",
+        'link "购买政策" @e4\ntextbox "站内搜索" @e12',
+    )
+    assert not requires_critical_confirmation(
+        PressAction(action="press", key="Enter", target="@e12"),
+        "搜索 BrowserSkill 后发送给我结果",
+        'textbox "搜索" @e12\ntextbox "发送消息" @e111',
+    )
+    assert not requires_critical_confirmation(
+        action,
+        "搜索 BrowserSkill 后发送给我结果",
+        'textbox "搜索" @e12\ntextbox "发送消息" @e111',
+    )
+    assert requires_critical_confirmation(
+        PressAction(action="press", key="Enter", target="@e111"),
+        "发送这条消息",
+        'textbox "消息" @e111',
+    )
+    assert requires_critical_confirmation(
+        action,
+        "发送这条消息",
+        'textbox "消息" @e111',
+        recent_fill_target="@e111",
+    )
+    assert requires_critical_confirmation(
+        action,
+        "发送这条消息",
+        'textbox "消息" @e205\ntextbox "收件人" @e206',
+        recent_fill_target="@e111",
+    )
+    assert not requires_critical_confirmation(
+        action,
+        "搜索 BrowserSkill 后发送给我结果",
+        'textbox "搜索" @e12\ntextbox "消息" @e111',
+        recent_fill_target="@e12",
+        recent_fill_was_search=True,
+    )
+    assert requires_critical_confirmation(
+        action,
+        "把这条消息发出去",
+        'textbox "消息" @e111',
+        recent_fill_target="@e111",
+    )
+    assert requires_critical_confirmation(
+        action,
+        "发个消息",
+        'textbox "消息" @e111',
+        recent_fill_target="@e111",
+    )
+    assert requires_critical_confirmation(
+        action,
+        "Send hello",
+        'textbox "Message" @e111',
+        recent_fill_target="@e111",
+    )
+    assert not requires_critical_confirmation(
+        action,
+        "Search hello",
+        'textbox "Search" @e12',
+        recent_fill_target="@e12",
+        recent_fill_was_search=True,
+    )
 
 
 @pytest.mark.parametrize(

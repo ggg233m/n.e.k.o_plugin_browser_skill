@@ -347,6 +347,7 @@ class BrowserSkillRuntime:
                         conversation_id=conversation_id,
                         browser_id=availability.selected_browser,
                         reuse_existing=self.settings.reuse_existing_window,
+                        adoption_key=self._adoption_key(raw_request or instruction),
                     )
                 except BskCommandError as exc:
                     raise LoopFailure(
@@ -473,6 +474,11 @@ class BrowserSkillRuntime:
             )
         )
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _adoption_key(instruction: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(instruction or "")).strip().casefold()
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else ""
 
     def _get_recent_result(self, request_key: str) -> BrowserTaskResult | None:
         ttl = self.settings.duplicate_suppression_seconds

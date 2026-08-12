@@ -37,6 +37,7 @@ class ChatBrowserSession:
     bsk_session_id: str
     browser_id: str
     reusable: bool
+    adoption_key: str = ""
     borrowed_tab_ids: set[int] = field(default_factory=set)
     current_tab_id: int | None = None
     current_url: str = ""
@@ -78,8 +79,8 @@ class SessionManager:
     def find(self, conversation_id: str | None = None) -> ChatBrowserSession | None:
         """Find a tracked session without starting or mutating browser state."""
         key = str(conversation_id or "").strip()
-        if key and key in self._sessions:
-            return self._sessions[key]
+        if key:
+            return self._sessions.get(key)
         unique = {item.bsk_session_id: item for item in self._sessions.values()}
         if len(unique) == 1:
             return next(iter(unique.values()))
@@ -96,13 +97,17 @@ class SessionManager:
         conversation_id: str | None,
         browser_id: str,
         reuse_existing: bool = True,
+        adoption_key: str = "",
     ) -> ChatBrowserSession:
+        adoption_key = str(adoption_key or "").strip()
         reusable = bool(str(conversation_id or "").strip())
         key = str(conversation_id).strip() if reusable else f"one-shot:{uuid.uuid4().hex}"
         existing = self._sessions.get(key)
         if existing is not None:
             if await self._is_live(existing.bsk_session_id):
                 await self.acquire_for_agent(existing)
+                if key == "browser-skill:main-dialog" and adoption_key:
+                    existing.adoption_key = adoption_key
                 existing.last_used_at = time.time()
                 self._debug(
                     "reuse_exact",
@@ -114,29 +119,35 @@ class SessionManager:
             self._sessions.pop(key, None)
 
         if reuse_existing:
-            # A native tool call and a fallback plugin run can arrive with
-            # different context keys. Re-key the one live plugin-owned session
-            # instead of opening a second Agent Window.
-            for old_key, candidate in list(self._sessions.items()):
-                if candidate.browser_id != browser_id:
-                    continue
-                if not await self._is_live(candidate.bsk_session_id):
-                    await self.stop_idle_handoff(candidate)
-                    await self.stop_keepalive(candidate)
-                    self._sessions.pop(old_key, None)
-                    continue
-                await self.acquire_for_agent(candidate)
-                self._sessions.pop(old_key, None)
-                candidate.conversation_id = key
-                candidate.reusable = reusable
-                candidate.last_used_at = time.time()
-                self._sessions[key] = candidate
-                self._debug(
-                    "reuse_rekeyed",
-                    conversation=self._tag(key),
-                    session=self._tag(candidate.bsk_session_id),
-                )
-                return candidate
+            # Older native-tool callbacks may lack role/conversation context and
+            # use this one technical placeholder. A later scoped fallback may
+            # adopt it only when both calls carry the same user-request key.
+            # Browser identity alone is not enough to cross a scope boundary.
+            placeholder_key = "browser-skill:main-dialog"
+            candidate = self._sessions.get(placeholder_key)
+            if (
+                key != placeholder_key
+                and candidate is not None
+                and candidate.browser_id == browser_id
+                and adoption_key
+                and candidate.adoption_key == adoption_key
+            ):
+                if await self._is_live(candidate.bsk_session_id):
+                    await self.acquire_for_agent(candidate)
+                    self._sessions.pop(placeholder_key, None)
+                    candidate.conversation_id = key
+                    candidate.reusable = reusable
+                    candidate.last_used_at = time.time()
+                    self._sessions[key] = candidate
+                    self._debug(
+                        "reuse_placeholder",
+                        conversation=self._tag(key),
+                        session=self._tag(candidate.bsk_session_id),
+                    )
+                    return candidate
+                await self.stop_idle_handoff(candidate)
+                await self.stop_keepalive(candidate)
+                self._sessions.pop(placeholder_key, None)
 
         payload = await self.client.start_session(browser_id)
         session = ChatBrowserSession(
@@ -144,6 +155,7 @@ class SessionManager:
             bsk_session_id=str(payload["session_id"]),
             browser_id=str(payload.get("browser_instance_id") or browser_id),
             reusable=reusable,
+            adoption_key=adoption_key,
         )
         self._sessions[key] = session
         self._debug(

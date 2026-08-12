@@ -20,9 +20,11 @@ from plugin.plugins.browser_skill.runtime.models import (
     PressAction,
     RuntimeSettings,
     ScrollAction,
+    SelectAction,
     SnapshotAction,
     TabCreateAction,
     TabListAction,
+    TabSelectAction,
 )
 from plugin.plugins.browser_skill.runtime.session_manager import (
     SessionManager,
@@ -73,6 +75,7 @@ class FakeBsk:
         self.help_count = 0
         self.clicks: list[str] = []
         self.fills: list[tuple[str, str]] = []
+        self.selects: list[tuple[str, list[str]]] = []
         self.url = "https://example.com/"
         self.session_ids: list[str] = []
         self.snapshot_counter = 0
@@ -157,6 +160,15 @@ class FakeBsk:
         self.fills.append((target, value))
         return {}
 
+    async def select(
+        self,
+        session_id: str,
+        target: str,
+        values: list[str],
+    ) -> dict[str, Any]:
+        self.selects.append((target, values))
+        return {}
+
     async def request_help(self, session_id: str, **kwargs: Any) -> dict[str, Any]:
         self.help_count += 1
         return {"outcome": "completed"}
@@ -207,23 +219,92 @@ async def test_conversation_session_reuses_live_session_and_close_cleans_it() ->
 
 
 @pytest.mark.asyncio
-async def test_different_context_keys_reuse_the_one_existing_agent_window() -> None:
+async def test_placeholder_context_can_be_adopted_by_a_concrete_scope() -> None:
     client = FakeBsk()
     sessions = SessionManager(client)  # type: ignore[arg-type]
     native = await sessions.get_or_create(
         conversation_id="browser-skill:main-dialog",
         browser_id="browser-1",
+        adoption_key="same-request",
     )
     fallback = await sessions.get_or_create(
         conversation_id="lanlan:another-context",
         browser_id="browser-1",
         reuse_existing=True,
+        adoption_key="same-request",
     )
 
     assert native is fallback
     assert fallback.conversation_id == "lanlan:another-context"
     assert client.started == 1
-    assert list(sessions.sessions) == ["lanlan:another-context"]
+    assert set(sessions.sessions) == {"lanlan:another-context"}
+    assert sessions.find("missing-context") is None
+
+
+@pytest.mark.asyncio
+async def test_placeholder_context_is_not_adopted_without_the_same_request_key() -> None:
+    client = FakeBsk()
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    placeholder = await sessions.get_or_create(
+        conversation_id="browser-skill:main-dialog",
+        browser_id="browser-1",
+        adoption_key="first-request",
+    )
+    scoped = await sessions.get_or_create(
+        conversation_id="lanlan:another-context",
+        browser_id="browser-1",
+        reuse_existing=True,
+        adoption_key="different-request",
+    )
+
+    assert placeholder is not scoped
+    assert client.started == 2
+    assert set(sessions.sessions) == {
+        "browser-skill:main-dialog",
+        "lanlan:another-context",
+    }
+
+
+@pytest.mark.asyncio
+async def test_reused_placeholder_refreshes_key_for_current_request_adoption() -> None:
+    client = FakeBsk()
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    original = await sessions.get_or_create(
+        conversation_id="browser-skill:main-dialog",
+        browser_id="browser-1",
+        adoption_key="first-request",
+    )
+    reused = await sessions.get_or_create(
+        conversation_id="browser-skill:main-dialog",
+        browser_id="browser-1",
+        adoption_key="current-request",
+    )
+    adopted = await sessions.get_or_create(
+        conversation_id="lanlan:current-context",
+        browser_id="browser-1",
+        adoption_key="current-request",
+    )
+
+    assert original is reused is adopted
+    assert adopted.adoption_key == "current-request"
+    assert client.started == 1
+    assert set(sessions.sessions) == {"lanlan:current-context"}
+
+
+@pytest.mark.asyncio
+async def test_concrete_context_keys_keep_sessions_isolated() -> None:
+    client = FakeBsk()
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    first = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    second = await sessions.get_or_create(
+        conversation_id="chat-2",
+        browser_id="browser-1",
+        reuse_existing=True,
+    )
+
+    assert first is not second
+    assert client.started == 2
+    assert set(sessions.sessions) == {"chat-1", "chat-2"}
 
 
 @pytest.mark.asyncio
@@ -531,6 +612,238 @@ async def test_snapshot_link_ref_uses_href_navigation_instead_of_dom_click() -> 
     assert html_reads == ["@e5"]
     assert client.clicks == []
     assert client.url == "https://github.com/project-neko/neko"
+
+
+@pytest.mark.asyncio
+async def test_critical_words_in_normal_http_link_do_not_request_confirmation() -> None:
+    client = FakeBsk()
+    client.url = "https://example.com/help"
+
+    async def link_snapshot(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        client.snapshot_token_limits.append(int(kwargs.get("max_tokens") or 0))
+        return {"text": 'link "Delete account documentation" @e4', "tab_id": 11}
+
+    async def link_html(
+        _session_id: str,
+        *,
+        ref: str | None = None,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        assert ref == "@e4"
+        return {"html": '<a href="/docs/delete-account">Delete account documentation</a>'}
+
+    client.snapshot = link_snapshot  # type: ignore[method-assign]
+    client.get_html = link_html  # type: ignore[method-assign]
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        ClickAction(action="click", target="@e4"),
+        DoneAction(action="done", summary="已打开文档"),
+        DoneAction(action="done", summary="已复核文档"),
+    )
+
+    result = await make_loop(client, sessions).run(
+        instruction="打开删除账户的帮助文档",
+        raw_request="打开删除账户的帮助文档",
+        session=session,
+        planner=planner,
+    )
+
+    assert result.success is True
+    assert client.help_count == 0
+    assert client.clicks == []
+    assert client.url == "https://example.com/docs/delete-account"
+
+
+@pytest.mark.asyncio
+async def test_side_effect_http_link_named_delete_requires_confirmation() -> None:
+    client = FakeBsk()
+    client.url = "https://example.com/items"
+
+    async def link_snapshot(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        client.snapshot_token_limits.append(int(kwargs.get("max_tokens") or 0))
+        return {"text": 'link "Delete" @e4', "tab_id": 11}
+
+    async def link_html(
+        _session_id: str,
+        *,
+        ref: str | None = None,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        assert ref == "@e4"
+        return {"html": '<a href="/items/delete">Delete</a>'}
+
+    client.snapshot = link_snapshot  # type: ignore[method-assign]
+    client.get_html = link_html  # type: ignore[method-assign]
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        ClickAction(action="click", target="@e4"),
+        DoneAction(action="done", summary="已打开页面"),
+        DoneAction(action="done", summary="已复核页面"),
+    )
+
+    result = await make_loop(client, sessions).run(
+        instruction="打开 Delete 页面",
+        raw_request="打开 Delete 页面",
+        session=session,
+        planner=planner,
+    )
+
+    assert result.success is True
+    assert client.help_count == 1
+    assert client.clicks == []
+    assert client.url == "https://example.com/items/delete"
+
+
+@pytest.mark.asyncio
+async def test_non_http_href_is_replanned_without_dom_click() -> None:
+    client = FakeBsk()
+    client.url = "https://example.com/actions"
+
+    async def link_snapshot(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        client.snapshot_token_limits.append(int(kwargs.get("max_tokens") or 0))
+        return {
+            "text": 'link "Run script" @e4; link "Safe page" @e5',
+            "tab_id": 11,
+        }
+
+    async def link_html(
+        _session_id: str,
+        *,
+        ref: str | None = None,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        if ref == "@e4":
+            return {"html": '<a href="javascript:runAction()">Run script</a>'}
+        return {"html": '<a href="/safe">Safe page</a>'}
+
+    client.snapshot = link_snapshot  # type: ignore[method-assign]
+    client.get_html = link_html  # type: ignore[method-assign]
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        ClickAction(action="click", target="@e4"),
+        ClickAction(action="click", target="@e5"),
+        DoneAction(action="done", summary="已打开安全页面"),
+        DoneAction(action="done", summary="已复核安全页面"),
+    )
+
+    result = await make_loop(client, sessions).run(
+        instruction="打开安全页面",
+        raw_request="打开安全页面",
+        session=session,
+        planner=planner,
+    )
+
+    assert result.success is True
+    assert client.help_count == 0
+    assert client.clicks == []
+    assert client.url == "https://example.com/safe"
+    assert any("non-HTTP(S) scheme" in item for item in planner.histories[1])
+
+
+@pytest.mark.asyncio
+async def test_download_link_keeps_dom_click_confirmation() -> None:
+    client = FakeBsk()
+    client.url = "https://example.com/files"
+
+    async def link_snapshot(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        client.snapshot_token_limits.append(int(kwargs.get("max_tokens") or 0))
+        return {"text": 'link "Download file" @e4', "tab_id": 11}
+
+    async def link_html(
+        _session_id: str,
+        *,
+        ref: str | None = None,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        assert ref == "@e4"
+        return {"html": '<a href="/files/report.pdf" download>Download file</a>'}
+
+    client.snapshot = link_snapshot  # type: ignore[method-assign]
+    client.get_html = link_html  # type: ignore[method-assign]
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        ClickAction(action="click", target="@e4"),
+        DoneAction(action="done", summary="已下载"),
+        DoneAction(action="done", summary="已复核下载"),
+    )
+
+    result = await make_loop(client, sessions).run(
+        instruction="下载这个文件",
+        raw_request="下载这个文件",
+        session=session,
+        planner=planner,
+    )
+
+    assert result.success is True
+    assert client.help_count == 1
+    assert client.clicks == ["@e4"]
+
+
+@pytest.mark.asyncio
+async def test_css_selector_click_is_replanned_without_human_confirmation() -> None:
+    client = FakeBsk()
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        ClickAction(action="click", target="button[data-action=delete]"),
+        ClickAction(action="click", target="@e9"),
+        DoneAction(action="done", summary="已删除"),
+        DoneAction(action="done", summary="已复核删除"),
+    )
+
+    result = await make_loop(client, sessions).run(
+        instruction="删除这条内容",
+        raw_request="删除这条内容",
+        session=session,
+        planner=planner,
+    )
+
+    assert result.success is True
+    assert client.help_count == 1
+    assert client.clicks == ["@e9"]
+    assert any("model-invented target for click" in item for item in planner.histories[1])
+
+
+@pytest.mark.asyncio
+async def test_css_fill_and_select_are_replanned_to_observed_refs() -> None:
+    client = FakeBsk()
+
+    async def form_snapshot(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        client.snapshot_token_limits.append(int(kwargs.get("max_tokens") or 0))
+        return {
+            "text": 'textbox "Nickname" @e7; combobox "Theme" @e8',
+            "tab_id": 11,
+        }
+
+    client.snapshot = form_snapshot  # type: ignore[method-assign]
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        FillAction(action="fill", target="#nickname", value="Neko"),
+        FillAction(action="fill", target="@e7", value="Neko"),
+        SelectAction(action="select", target="select[name=theme]", values=["dark"]),
+        SelectAction(action="select", target="@e8", values=["dark"]),
+        DoneAction(action="done", summary="表单已填写"),
+        DoneAction(action="done", summary="已复核表单"),
+    )
+
+    result = await make_loop(client, sessions).run(
+        instruction="填写昵称并选择主题",
+        raw_request="填写昵称并选择主题",
+        session=session,
+        planner=planner,
+    )
+
+    assert result.success is True
+    assert client.help_count == 0
+    assert client.fills == [("@e7", "Neko")]
+    assert client.selects == [("@e8", ["dark"])]
+    assert any("model-invented target for fill" in item for item in planner.histories[1])
+    assert any("model-invented target for select" in item for item in planner.histories[3])
 
 
 @pytest.mark.asyncio
@@ -888,7 +1201,7 @@ async def test_non_search_fill_submit_is_replanned_as_separate_actions() -> None
 
     def page_text() -> str:
         sent = '; StaticText "测试消息已经成功发送"' if state["sent"] else ""
-        return f'textbox "给 DeepSeek 发送消息" [empty] @e111{sent}'
+        return f'textbox "消息" [empty] @e111{sent}'
 
     async def chat_snapshot(_session_id: str, **kwargs: Any) -> dict[str, Any]:
         client.snapshot_token_limits.append(int(kwargs.get("max_tokens") or 0))
@@ -926,7 +1239,7 @@ async def test_non_search_fill_submit_is_replanned_as_separate_actions() -> None
             value="测试消息",
             submit=False,
         ),
-        PressAction(action="press", key="Enter", target="@e111", reason="发送消息"),
+        PressAction(action="press", key="Enter", reason="发送消息"),
         DoneAction(
             action="done",
             summary="消息已发送",
@@ -945,12 +1258,75 @@ async def test_non_search_fill_submit_is_replanned_as_separate_actions() -> None
     assert result.success is True
     assert result.steps == 4
     assert client.fills == [("@e111", "测试消息")]
-    assert client.pressed == [("Enter", "@e111")]
+    assert client.pressed == [("Enter", None)]
     assert client.help_count == 1
     assert any(
         "fill.submit is only a search-box shortcut" in item
         for item in planner.histories[1]
     )
+
+
+@pytest.mark.asyncio
+async def test_search_fill_state_is_cleared_when_switching_tabs_before_enter() -> None:
+    client = FakeBsk()
+    state = {"sent": False}
+
+    async def changing_snapshot(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        client.snapshot_token_limits.append(int(kwargs.get("max_tokens") or 0))
+        if client.selected_tabs:
+            sent = '; StaticText "消息已成功发送"' if state["sent"] else ""
+            return {"text": f'textbox "消息" @e111{sent}', "tab_id": 12}
+        return {"text": 'textbox "搜索" @e12', "tab_id": 11}
+
+    async def send_message(
+        _session_id: str,
+        key: str,
+        *,
+        target: str | None = None,
+    ) -> dict[str, Any]:
+        client.pressed.append((key, target))
+        if key == "Enter":
+            state["sent"] = True
+        return {}
+
+    async def changing_observe(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        client.observe_count += 1
+        client.observe_token_limits.append(int(kwargs.get("max_tokens") or 0))
+        sent = '; StaticText "消息已成功发送"' if state["sent"] else ""
+        return {"text": f'textbox "消息" @e111{sent}'}
+
+    client.snapshot = changing_snapshot  # type: ignore[method-assign]
+    client.observe = changing_observe  # type: ignore[method-assign]
+    client.press = send_message  # type: ignore[method-assign]
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        FillAction(action="fill", target="@e12", value="hello", submit=False),
+        TabSelectAction(action="tab_select", tab_id=12),
+        PressAction(action="press", key="Enter"),
+        DoneAction(
+            action="done",
+            summary="消息已发送",
+            visible_evidence="消息已成功发送",
+        ),
+        DoneAction(
+            action="done",
+            summary="已复核消息发送结果",
+            visible_evidence="消息已成功发送",
+        ),
+        autofill_verified_done=False,
+    )
+
+    result = await make_loop(client, sessions).run(
+        instruction="先搜索 hello，再切换标签页发送这条消息",
+        raw_request="先搜索 hello，再切换标签页发送这条消息",
+        session=session,
+        planner=planner,
+    )
+
+    assert result.success is True
+    assert client.help_count == 1
+    assert client.pressed == [("Enter", None)]
 
 
 @pytest.mark.asyncio
@@ -1367,6 +1743,14 @@ def test_navigation_url_verifier_ignores_only_extra_or_volatile_tracking_paramet
         "https://example.com/path?q=111",
         "https://example.com/path?q=222&utm_source=random",
     ) == "query_mismatch"
+    assert AgentLoop._navigation_url_issue(
+        "https://example.com/item?pk_id=123",
+        "https://example.com/item?pk_id=456",
+    ) == "query_mismatch"
+    assert AgentLoop._navigation_url_issue(
+        "https://example.com/path?q=111&pk_campaign=first",
+        "https://example.com/path?q=111&pk_campaign=second",
+    ) is None
 
 
 def test_full_url_key_ignores_known_search_tracking_but_preserves_semantics() -> None:
@@ -2077,6 +2461,10 @@ async def test_borrowed_user_tab_is_confirmed_and_returned_at_task_end() -> None
 async def test_second_consecutive_stale_ref_returns_stable_error() -> None:
     client = FakeBsk()
 
+    async def observed_click_snapshot(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        client.snapshot_token_limits.append(int(kwargs.get("max_tokens") or 0))
+        return {"text": 'button "展开详情" @e2', "tab_id": 11}
+
     async def stale_click(session_id: str, target: str, **kwargs: Any) -> dict[str, Any]:
         result = BskCommandResult(
             ("click", target),
@@ -2088,6 +2476,7 @@ async def test_second_consecutive_stale_ref_returns_stable_error() -> None:
         raise BskCommandError(result)
 
     client.click = stale_click  # type: ignore[method-assign]
+    client.snapshot = observed_click_snapshot  # type: ignore[method-assign]
     sessions = SessionManager(client)  # type: ignore[arg-type]
     session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
     planner = FakePlanner(

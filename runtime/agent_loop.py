@@ -56,8 +56,11 @@ from .models import (
 from .policy import (
     PolicyViolation,
     additional_agent_tab_requested,
+    http_link_requires_confirmation,
     is_search_fill,
     is_sensitive_fill,
+    observed_controls_match,
+    observed_target_control,
     requested_agent_tab_count,
     requires_critical_confirmation,
     user_tab_requested,
@@ -125,13 +128,23 @@ _TRACKING_QUERY_KEYS = {
     "mc_cid",
     "mc_eid",
     "msclkid",
+    "pk_campaign",
+    "pk_cid",
+    "pk_content",
+    "pk_keyword",
+    "pk_kwd",
+    "pk_medium",
+    "pk_ref",
+    "pk_ses",
+    "pk_source",
+    "pk_vid",
     "scm",
     "spm",
     "yclid",
     "_ga",
     "_gl",
 }
-_TRACKING_QUERY_PREFIXES = ("utm_", "pk_")
+_TRACKING_QUERY_PREFIXES = ("utm_",)
 _HOST_TRACKING_QUERY_KEYS = {
     "bing.com": {"cvid", "form"},
     "google.com": {"ei", "gs_lcrp", "oq", "sourceid", "uact", "ved"},
@@ -349,14 +362,24 @@ class _FirstHrefParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.href = ""
+        self.requires_dom_click = False
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if self.href or tag.casefold() not in {"a", "area"}:
             return
         for name, value in attrs:
-            if name.casefold() == "href" and value:
+            normalized_name = name.casefold()
+            if normalized_name == "download":
+                self.requires_dom_click = True
+            if normalized_name == "href" and value:
                 self.href = value.strip()
-                return
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedLinkTarget:
+    href: str = ""
+    requires_dom_click: bool = False
+    unsafe_href: bool = False
 
 
 class Planner(Protocol):
@@ -1109,6 +1132,8 @@ class AgentLoop:
         completion_rejection_url = ""
         replannable_policy_rejections = 0
         verification_required = False
+        recent_fill_target: str | None = None
+        recent_fill_was_search = False
         steps = 0
         finalized = False
         stale_failures = 0
@@ -1124,12 +1149,15 @@ class AgentLoop:
             nonlocal completion_rejection_count, completion_rejection_hash
             nonlocal completion_rejection_url
             nonlocal replannable_policy_rejections, completion_contract
+            nonlocal recent_fill_target, recent_fill_was_search
             if control is None:
                 return False
             updates = control.consume_updates()
             if not updates:
                 return False
             for update in updates:
+                recent_fill_target = None
+                recent_fill_was_search = False
                 if update.mode == "cancel":
                     control.mark_applied(
                         update,
@@ -1787,6 +1815,8 @@ class AgentLoop:
                         step=steps,
                         control=control,
                         planned_revision=planned_revision,
+                        recent_fill_target=recent_fill_target,
+                        recent_fill_was_search=recent_fill_was_search,
                     )
                 except BskCommandError as exc:
                     if control is not None and control.cancel_requested:
@@ -1865,9 +1895,9 @@ class AgentLoop:
                         if replannable_policy_rejections >= 3:
                             raise LoopFailure(
                                 "ACTION_REJECTED",
-                                "Agent 连续选择了不适用于当前输入框的组合提交动作",
+                                "Agent 连续选择了未绑定到当前页面快照的交互动作",
                                 hint=(
-                                    "当前页面未被修改；已停止重复规划。继续时请拆分填写与发送动作。"
+                                    "当前页面未被修改；已停止重复规划。继续时请使用最新快照中的 @eN 引用。"
                                 ),
                                 retryable=True,
                                 status="needs_user",
@@ -1994,6 +2024,12 @@ class AgentLoop:
                     and action.key.casefold() in {"enter", "return"}
                 ):
                     completion_contract.search_submitted = True
+                if isinstance(action, FillAction) and not action.submit:
+                    recent_fill_target = action.target
+                    recent_fill_was_search = is_search_fill(action, observation)
+                elif isinstance(action, self._MUTATING_ACTIONS):
+                    recent_fill_target = None
+                    recent_fill_was_search = False
                 if explicit_observation is not None:
                     observation = self._with_url(explicit_observation, current_url)
                     observation_level = level
@@ -2154,6 +2190,8 @@ class AgentLoop:
         step: int,
         control: BrowserTaskControl | None,
         planned_revision: int,
+        recent_fill_target: str | None = None,
+        recent_fill_was_search: bool = False,
     ) -> tuple[str, str, str | None, int]:
         sid = session.bsk_session_id
         if isinstance(action, SnapshotAction):
@@ -2216,6 +2254,7 @@ class AgentLoop:
             payload = await self._retry_browser(lambda: self.client.reload(sid, hard=action.hard))
             return "Reloaded the current page.", self._extract_url(payload), None, 1
         if isinstance(action, FillAction):
+            self._require_observed_ref("fill", action.target, observation)
             if is_sensitive_fill(action, observation):
                 await self._help(
                     session,
@@ -2248,7 +2287,53 @@ class AgentLoop:
                 )
             return f"Filled target {action.target}; value omitted.", "", None, 1
         if isinstance(action, ClickAction):
-            if requires_critical_confirmation(action, instruction, observation):
+            confirmed_observation = observation
+            self._require_observed_ref("click", action.target, observation)
+            resolved_link = await self._resolve_link_target(
+                sid,
+                action.target,
+                observation=observation,
+            )
+            if resolved_link.unsafe_href:
+                raise PolicyViolation(
+                    "ACTION_REJECTED",
+                    "链接使用了不允许的非 HTTP(S) 地址",
+                    replan_hint=(
+                        "Do not DOM-click a link whose href is javascript:, data:, mailto:, or another "
+                        "non-HTTP(S) scheme. Choose a safe current @eN control or a validated HTTP(S) route."
+                    ),
+                )
+            link_confirmation_required = bool(
+                resolved_link.requires_dom_click
+                or (
+                    resolved_link.href
+                    and http_link_requires_confirmation(
+                        action,
+                        instruction,
+                        observation,
+                        resolved_link.href,
+                    )
+                )
+                or (
+                    not resolved_link.href
+                    and requires_critical_confirmation(action, instruction, observation)
+                )
+            )
+            if resolved_link.href and not link_confirmation_required:
+                payload = await self._retry_browser(
+                    lambda: self.client.navigate(
+                        sid,
+                        resolved_link.href,
+                        wait_until="domcontentloaded",
+                    )
+                )
+                return (
+                    "Opened a normal HTTP(S) link through its resolved href instead of DOM click dispatch.",
+                    self._extract_url(payload) or resolved_link.href,
+                    None,
+                    1,
+                )
+            if link_confirmation_required:
                 outcome = await self._help(
                     session,
                     prompt=(
@@ -2272,29 +2357,36 @@ class AgentLoop:
                 if outcome == "navigated":
                     return "Confirmation was invalidated by navigation; the click was not executed.", "", None, 1
                 refreshed = await self._snapshot(session, self._observation_url(observation))
-                if action.target not in refreshed:
+                if not observed_controls_match(action.target, confirmed_observation, refreshed):
                     return (
                         "The confirmed click target changed after human control; the click was not executed.",
                         "",
                         refreshed,
                         1,
                     )
-            resolved_href = await self._resolve_link_target(
-                sid,
-                action.target,
-                observation=observation,
-            )
-            if resolved_href:
+                refreshed_link = await self._resolve_link_target(
+                    sid,
+                    action.target,
+                    observation=refreshed,
+                )
+                if refreshed_link != resolved_link:
+                    return (
+                        "The confirmed link destination changed after human control; the click was not executed.",
+                        "",
+                        refreshed,
+                        1,
+                    )
+            if resolved_link.href and not resolved_link.requires_dom_click:
                 payload = await self._retry_browser(
                     lambda: self.client.navigate(
                         sid,
-                        resolved_href,
+                        resolved_link.href,
                         wait_until="domcontentloaded",
                     )
                 )
                 return (
-                    "Opened a normal HTTP(S) link through its resolved href instead of DOM click dispatch.",
-                    self._extract_url(payload) or resolved_href,
+                    "Opened a confirmed HTTP(S) link through its resolved href.",
+                    self._extract_url(payload) or resolved_link.href,
                     None,
                     1,
                 )
@@ -2308,10 +2400,20 @@ class AgentLoop:
             )
             return f"Clicked target {action.target}.", "", None, 1
         if isinstance(action, SelectAction):
+            self._require_observed_ref("select", action.target, observation)
             await self._retry_browser(lambda: self.client.select(sid, action.target, action.values))
             return f"Selected option(s) on target {action.target}; values omitted.", "", None, 1
         if isinstance(action, PressAction):
-            if requires_critical_confirmation(action, instruction, observation):
+            confirmed_observation = observation
+            if action.target:
+                self._require_observed_ref("press", action.target, observation)
+            if requires_critical_confirmation(
+                action,
+                instruction,
+                observation,
+                recent_fill_target=recent_fill_target,
+                recent_fill_was_search=recent_fill_was_search,
+            ):
                 outcome = await self._help(
                     session,
                     prompt=(
@@ -2335,7 +2437,11 @@ class AgentLoop:
                 if outcome == "navigated":
                     return "Confirmation was invalidated by navigation; the key press was not executed.", "", None, 1
                 refreshed = await self._snapshot(session, self._observation_url(observation))
-                if action.target and action.target not in refreshed:
+                if action.target and not observed_controls_match(
+                    action.target,
+                    confirmed_observation,
+                    refreshed,
+                ):
                     return (
                         "The confirmed key target changed after human control; the key press was not executed.",
                         "",
@@ -2552,17 +2658,13 @@ class AgentLoop:
         target: str,
         *,
         observation: str,
-    ) -> str:
-        """Resolve a snapshot link ref to a safe URL, falling back to click when unavailable."""
+    ) -> _ResolvedLinkTarget:
+        """Resolve a snapshot link ref and report whether it needs DOM click semantics."""
         if not re.fullmatch(r"@?e\d+", target):
-            return ""
-        normalized = target if target.startswith("@") else f"@{target}"
-        target_line = next(
-            (line for line in observation.splitlines() if normalized in line),
-            "",
-        )
+            return _ResolvedLinkTarget()
+        target_line = observed_target_control(target, observation)
         if not re.search(r"(?i)(?:^|\s)(?:link|链接)(?:\s|$)", target_line):
-            return ""
+            return _ResolvedLinkTarget()
         try:
             payload = await self.client.get_html(
                 session_id,
@@ -2572,21 +2674,39 @@ class AgentLoop:
         except BskCommandError as exc:
             if exc.exit_code in {2, 4, 5}:
                 raise
-            return ""
+            return _ResolvedLinkTarget()
         parser = _FirstHrefParser()
         try:
             parser.feed(str(payload.get("html") or ""))
         except Exception:
-            return ""
+            return _ResolvedLinkTarget()
         if not parser.href:
-            return ""
+            return _ResolvedLinkTarget()
         base_url = self._observation_url(observation)
         resolved = urljoin(base_url, parser.href)
         try:
             validate_action(NavigateAction(action="navigate", url=resolved))
         except (PolicyViolation, ValueError):
-            return ""
-        return resolved
+            return _ResolvedLinkTarget(unsafe_href=True)
+        return _ResolvedLinkTarget(
+            href=resolved,
+            requires_dom_click=parser.requires_dom_click,
+        )
+
+    @staticmethod
+    def _require_observed_ref(action_name: str, target: str, observation: str) -> str:
+        target_line = observed_target_control(target, observation)
+        if re.fullmatch(r"@e\d+", str(target or ""), flags=re.IGNORECASE) and target_line:
+            return target_line
+        raise PolicyViolation(
+            "ACTION_REJECTED",
+            f"{action_name} 必须使用当前页面快照中仍存在的 @eN 引用",
+            replan_hint=(
+                f"Do not use a CSS selector, stale ref, or model-invented target for {action_name}. "
+                "Choose the exact current @eN ref from the latest observation. This rejection did not "
+                "change the page and does not require human help."
+            ),
+        )
 
     async def _execute_scroll(
         self,

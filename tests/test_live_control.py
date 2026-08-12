@@ -84,6 +84,7 @@ def test_live_context_payload_excludes_free_text_and_page_content() -> None:
             "pending_updates": 0,
             "message": "页面正文不应进入上下文",
             "summary": "模型生成的总结也不应进入实时状态",
+            "page": {"observation": "secret page body"},
             "page_text": "secret page body",
         }
     )
@@ -92,7 +93,14 @@ def test_live_context_payload_excludes_free_text_and_page_content() -> None:
     assert payload["goal_revision"] == 1
     assert "message" not in payload
     assert "summary" not in payload
+    assert "page" not in payload
     assert "page_text" not in payload
+
+    explicit = _live_status_payload(
+        {"stage": "idle", "page": {"content_trust": "untrusted_page_data"}},
+        include_page=True,
+    )
+    assert explicit["page"] == {"content_trust": "untrusted_page_data"}
 
 
 def test_live_context_uses_passive_hidden_coalesced_push_message() -> None:
