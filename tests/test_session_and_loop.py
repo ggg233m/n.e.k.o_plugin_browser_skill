@@ -26,6 +26,7 @@ from plugin.plugins.browser_skill.runtime.models import (
     TabListAction,
     TabSelectAction,
 )
+from plugin.plugins.browser_skill.runtime.policy import PolicyViolation
 from plugin.plugins.browser_skill.runtime.session_manager import (
     SessionManager,
 )
@@ -1258,7 +1259,7 @@ async def test_non_search_fill_submit_is_replanned_as_separate_actions() -> None
     assert result.success is True
     assert result.steps == 4
     assert client.fills == [("@e111", "测试消息")]
-    assert client.pressed == [("Enter", None)]
+    assert client.pressed == [("Enter", "@e111")]
     assert client.help_count == 1
     assert any(
         "fill.submit is only a search-box shortcut" in item
@@ -1275,7 +1276,7 @@ async def test_search_fill_state_is_cleared_when_switching_tabs_before_enter() -
         client.snapshot_token_limits.append(int(kwargs.get("max_tokens") or 0))
         if client.selected_tabs:
             sent = '; StaticText "消息已成功发送"' if state["sent"] else ""
-            return {"text": f'textbox "消息" @e111{sent}', "tab_id": 12}
+            return {"text": f'textbox "消息" [focused] @e111{sent}', "tab_id": 12}
         return {"text": 'textbox "搜索" @e12', "tab_id": 11}
 
     async def send_message(
@@ -1293,7 +1294,7 @@ async def test_search_fill_state_is_cleared_when_switching_tabs_before_enter() -
         client.observe_count += 1
         client.observe_token_limits.append(int(kwargs.get("max_tokens") or 0))
         sent = '; StaticText "消息已成功发送"' if state["sent"] else ""
-        return {"text": f'textbox "消息" @e111{sent}'}
+        return {"text": f'textbox "消息" [focused] @e111{sent}'}
 
     client.snapshot = changing_snapshot  # type: ignore[method-assign]
     client.observe = changing_observe  # type: ignore[method-assign]
@@ -1326,7 +1327,65 @@ async def test_search_fill_state_is_cleared_when_switching_tabs_before_enter() -
 
     assert result.success is True
     assert client.help_count == 1
-    assert client.pressed == [("Enter", None)]
+    assert client.pressed == [("Enter", "@e111")]
+
+
+@pytest.mark.asyncio
+async def test_critical_targetless_enter_without_focus_is_rejected() -> None:
+    client = FakeBsk()
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    loop = make_loop(client, sessions)
+
+    with pytest.raises(PolicyViolation, match="缺少明确的当前焦点目标"):
+        await loop._execute_action(
+            PressAction(action="press", key="Enter"),
+            instruction="发送这条消息",
+            observation='textbox "消息" @e111',
+            observation_level=1,
+            session=session,
+            vision=None,  # type: ignore[arg-type]
+            progress=None,
+            step=1,
+            control=None,
+            planned_revision=0,
+        )
+
+    assert client.help_count == 0
+    assert client.pressed == []
+
+
+@pytest.mark.asyncio
+async def test_targetless_enter_is_not_pressed_when_confirmed_focus_changes() -> None:
+    client = FakeBsk()
+
+    async def changed_snapshot(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        client.snapshot_token_limits.append(int(kwargs.get("max_tokens") or 0))
+        return {"text": 'textbox "另一个字段" [focused] @e111', "tab_id": 11}
+
+    client.snapshot = changed_snapshot  # type: ignore[method-assign]
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    loop = make_loop(client, sessions)
+
+    result_text, _, refreshed, _ = await loop._execute_action(
+        PressAction(action="press", key="Enter"),
+        instruction="发送这条消息",
+        observation='textbox "消息" [focused] @e111',
+        observation_level=1,
+        session=session,
+        vision=None,  # type: ignore[arg-type]
+        progress=None,
+        step=1,
+        control=None,
+        planned_revision=0,
+    )
+
+    assert "target changed" in result_text
+    assert refreshed is not None
+    assert 'textbox "另一个字段" [focused] @e111' in refreshed
+    assert client.help_count == 1
+    assert client.pressed == []
 
 
 @pytest.mark.asyncio

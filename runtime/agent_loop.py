@@ -56,6 +56,8 @@ from .models import (
 from .policy import (
     PolicyViolation,
     additional_agent_tab_requested,
+    critical_press_has_grounded_target,
+    grounded_critical_press_target,
     http_link_requires_confirmation,
     is_search_fill,
     is_sensitive_fill,
@@ -2407,6 +2409,27 @@ class AgentLoop:
             confirmed_observation = observation
             if action.target:
                 self._require_observed_ref("press", action.target, observation)
+            grounded_press_target = grounded_critical_press_target(
+                action,
+                instruction,
+                observation,
+                recent_fill_target=recent_fill_target,
+            )
+            if not critical_press_has_grounded_target(
+                action,
+                instruction,
+                observation,
+                recent_fill_target=recent_fill_target,
+            ):
+                raise PolicyViolation(
+                    "ACTION_REJECTED",
+                    "关键 Enter 操作缺少明确的当前焦点目标",
+                    replan_hint=(
+                        "Use an exact current @eN target, fill the intended field immediately before "
+                        "pressing Enter, or take a fresh snapshot that explicitly marks the field [focused]."
+                    ),
+                )
+            effective_press_target = action.target or grounded_press_target
             if requires_critical_confirmation(
                 action,
                 instruction,
@@ -2421,7 +2444,7 @@ class AgentLoop:
                         "确认后点击完成，取消则终止任务。"
                     ),
                     title="确认关键操作",
-                    targets=[action.target] if action.target else [],
+                    targets=[effective_press_target] if effective_press_target else [],
                     completion_criteria=None,
                     progress=progress,
                     step=step,
@@ -2437,8 +2460,8 @@ class AgentLoop:
                 if outcome == "navigated":
                     return "Confirmation was invalidated by navigation; the key press was not executed.", "", None, 1
                 refreshed = await self._snapshot(session, self._observation_url(observation))
-                if action.target and not observed_controls_match(
-                    action.target,
+                if effective_press_target and not observed_controls_match(
+                    effective_press_target,
                     confirmed_observation,
                     refreshed,
                 ):
@@ -2448,7 +2471,13 @@ class AgentLoop:
                         refreshed,
                         1,
                     )
-            await self._retry_browser(lambda: self.client.press(sid, action.key, target=action.target))
+            await self._retry_browser(
+                lambda: self.client.press(
+                    sid,
+                    action.key,
+                    target=effective_press_target,
+                )
+            )
             return f"Pressed {action.key}.", "", None, 1
         if isinstance(action, ScrollAction):
             return await self._execute_scroll(

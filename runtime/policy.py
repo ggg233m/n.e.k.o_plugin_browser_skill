@@ -110,6 +110,18 @@ _INFORMATIONAL_PATH_SEGMENTS = {
     "support",
     "tutorial",
 }
+_INFORMATIONAL_COMPOSITE_MARKERS = {
+    "doc",
+    "docs",
+    "documentation",
+    "faq",
+    "guide",
+    "guides",
+    "help",
+    "manual",
+    "policy",
+    "tutorial",
+}
 _SIDE_EFFECT_PATH_SEGMENTS = {
     "authorize",
     "buy",
@@ -151,10 +163,6 @@ def validate_http_url(url: str) -> str:
     return value
 
 
-def _matching_line(target: str | None, observation: str) -> str:
-    return _observed_matching_line(target, observation) or str(target or "").strip()
-
-
 def _observation_controls(observation: str) -> list[str]:
     controls: list[str] = []
     for line in str(observation or "").splitlines():
@@ -174,7 +182,7 @@ def observed_target_control(target: str | None, observation: str) -> str:
             flags=re.IGNORECASE,
         )
         for control in _observation_controls(observation):
-            if ref_pattern.search(control):
+            if ref_pattern.search(_observed_control_structure(control)):
                 return control[:1000]
         return ""
     return ""
@@ -205,13 +213,40 @@ def _observed_matching_line(target: str | None, observation: str) -> str:
     return observed_target_control(target, observation)
 
 
+def _observed_control_structure(control_line: str) -> str:
+    """Remove page-authored accessible names before reading snapshot state."""
+    return re.sub(r'"(?:\\.|[^"\\])*"', '""', str(control_line or ""))
+
+
+def _observed_control_is_focused(control_line: str) -> bool:
+    """判断页面快照是否明确标记该控件当前获得焦点。"""
+    structure = _observed_control_structure(control_line)
+    return bool(
+        re.search(
+            r"(?i)(?:\[\s*focused\s*\]|\bfocused\s*[:=]\s*(?:true|yes|1)\b)",
+            structure,
+        )
+    )
+
+
+def _observed_control_ref(control_line: str) -> str:
+    structure = _observed_control_structure(control_line)
+    matches = re.findall(r"(?i)(?<![\w@])@e\d+(?!\w)", structure)
+    return matches[-1] if matches else ""
+
+
 def _matches(patterns: tuple[str, ...], text: str) -> bool:
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
 
 
 def is_sensitive_fill(action: FillAction, observation: str) -> bool:
-    context = f"{_matching_line(action.target, observation)} {action.reason}"
-    return _matches(_SENSITIVE_PATTERNS, context)
+    # ``reason`` 不能授权动作，但可以保守地把一个已观察到的目标升级为
+    # 人工处理。这样即使密码框的可访问名称是通用的，也不会自动发送秘密。
+    target_line = _observed_matching_line(action.target, observation)
+    return bool(
+        target_line
+        and _matches(_SENSITIVE_PATTERNS, f"{target_line} {action.reason}")
+    )
 
 
 def is_search_fill(action: FillAction, observation: str) -> bool:
@@ -220,6 +255,59 @@ def is_search_fill(action: FillAction, observation: str) -> bool:
     # turn an ordinary form field into a harmless search box.
     target_line = _observed_matching_line(action.target, observation)
     return bool(target_line and _matches(_SEARCH_FIELD_PATTERNS, target_line))
+
+
+def grounded_critical_press_target(
+    action: AgentAction,
+    instruction: str,
+    observation: str,
+    *,
+    recent_fill_target: str | None = None,
+) -> str | None:
+    """Return the current ref that can safely receive a consequential Enter."""
+    if not isinstance(action, PressAction):
+        return None
+    if action.key.strip().casefold() not in _ACTIVATION_KEYS:
+        return None
+    if not _matches(_CRITICAL_ENTER_INTENT_PATTERNS, instruction):
+        return None
+    if action.target:
+        return action.target if _observed_matching_line(action.target, observation) else None
+    if recent_fill_target and _observed_matching_line(recent_fill_target, observation):
+        # A successful fill immediately before Enter is focus evidence, but the
+        # ref must still exist in the current snapshot so the press can be bound.
+        return recent_fill_target
+    focused_text_entries = [
+        control
+        for control in _observation_controls(observation)
+        if _TEXT_ENTRY_CONTROL_PATTERN.search(control)
+        and _observed_control_is_focused(control)
+    ]
+    if len(focused_text_entries) != 1:
+        return None
+    return _observed_control_ref(focused_text_entries[0]) or None
+
+
+def critical_press_has_grounded_target(
+    action: AgentAction,
+    instruction: str,
+    observation: str,
+    *,
+    recent_fill_target: str | None = None,
+) -> bool:
+    """Return whether a consequential Enter has a current bindable target."""
+    if not isinstance(action, PressAction):
+        return True
+    if action.key.strip().casefold() not in _ACTIVATION_KEYS:
+        return True
+    if not _matches(_CRITICAL_ENTER_INTENT_PATTERNS, instruction):
+        return True
+    return grounded_critical_press_target(
+        action,
+        instruction,
+        observation,
+        recent_fill_target=recent_fill_target,
+    ) is not None
 
 
 def requires_critical_confirmation(
@@ -279,26 +367,22 @@ def requires_critical_confirmation(
         return False
     if selected_from_recent_fill and recent_fill_was_search:
         return False
-    if selected_from_recent_fill and not target_line:
-        # Refs may be regenerated by the snapshot taken after fill. The
-        # immediately preceding non-search fill is still sufficient focus
-        # evidence for a clearly consequential Enter intent.
-        return True
-
-    # A target-less Enter acts on browser focus. Without a recent fill, use a
-    # control only when the snapshot has one unambiguous text-entry candidate.
-    # Buttons and links elsewhere are ignored so incidental purchase/help copy
-    # does not create confirmation prompts.
+    # 无目标 Enter 会作用于浏览器当前焦点。没有最近填写记录时，
+    # 只有快照明确标出 [focused] 的控件才足以授权；不能仅凭页面上
+    # 恰好只有一个文本框，就推断 Enter 一定会提交它。
     action_has_observed_target = bool(target and target_line)
+    selected_from_observed_focus = False
     if not target_line:
-        text_entry_lines = [
+        focused_text_entry_lines = [
             control
             for control in _observation_controls(observation)
             if _TEXT_ENTRY_CONTROL_PATTERN.search(control)
+            and _observed_control_is_focused(control)
         ]
-        if len(text_entry_lines) != 1:
+        if len(focused_text_entry_lines) != 1:
             return False
-        target_line = text_entry_lines[0]
+        target_line = focused_text_entry_lines[0]
+        selected_from_observed_focus = True
         if _matches(_SEARCH_FIELD_PATTERNS, target_line):
             return False
 
@@ -309,7 +393,7 @@ def requires_critical_confirmation(
     # A generic field is confirmed only when Enter is tied to an observed
     # target or to the field just filled by the agent. This protects unlabeled
     # editors while leaving ambiguous target-less pages unblocked.
-    return action_has_observed_target or selected_from_recent_fill
+    return action_has_observed_target or selected_from_recent_fill or selected_from_observed_focus
 
 
 def http_link_requires_confirmation(
@@ -318,35 +402,87 @@ def http_link_requires_confirmation(
     observation: str,
     resolved_url: str,
 ) -> bool:
-    """Classify an HTTP(S) href without treating every action word as a side effect."""
+    """判断 HTTP(S) 链接是否需要确认，避免把普通动作词都当成副作用。"""
     target_line = observed_target_control(action.target, observation)
     try:
         parsed = urlsplit(resolved_url)
     except ValueError:
         return True
-    segments = {
+    segments = [
         unquote(part).strip().casefold()
         for part in parsed.path.split("/")
         if part.strip()
-    }
-    # Exact action endpoints are never exempt merely because a parent path is
-    # called docs/help. A URL such as /docs/delete-account remains ordinary
-    # informational navigation because "delete-account" is not an endpoint verb.
-    if segments & _SIDE_EFFECT_PATH_SEGMENTS:
+    ]
+    segment_set = set(segments)
+
+    def segment_tokens(value: str) -> tuple[str, ...]:
+        return tuple(
+            token
+            for token in re.split(r"[-_.~]+", unquote(value).strip().casefold())
+            if token
+        )
+
+    def tokens_are_informational(tokens: tuple[str, ...]) -> bool:
+        return bool(
+            len(tokens) >= 3
+            and (
+                tokens[0] in _INFORMATIONAL_COMPOSITE_MARKERS
+                or tokens[-1] in _INFORMATIONAL_COMPOSITE_MARKERS
+            )
+        )
+
+    segment_tokens_list = [segment_tokens(segment) for segment in segments]
+    # 精确动作端点不会仅因父路径叫 docs/help 就被豁免。
+    # 例如 /docs/delete-account 中的 delete-account 不是独立端点动词，
+    # 因此仍按信息页面处理；但 /docs/delete 仍然需要确认。
+    if segment_set & _SIDE_EFFECT_PATH_SEGMENTS:
+        return True
+    # Web 框架常把端点动作写成复合词，而不是独立路径段
+    # （例如 ``/account/delete-account``、``/users/remove_member``）。
+    # 这里识别这类路径，同时避免把说明性文档 URL 当成副作用：
+    # 路径中出现 docs/help/policy 等信息词时，复合词仍按信息页面处理；
+    # 上面识别出的精确动作端点不受该豁免影响。
+    informational_path = bool(segment_set & _INFORMATIONAL_PATH_SEGMENTS)
+    strong_informational_path = bool(segment_set & _INFORMATIONAL_COMPOSITE_MARKERS)
+    informational_composite = any(
+        tokens_are_informational(tokens) for tokens in segment_tokens_list
+    )
+    composite_side_effect = any(
+        len(tokens) > 1
+        and bool(set(tokens) & _SIDE_EFFECT_PATH_SEGMENTS)
+        and not tokens_are_informational(tokens)
+        for tokens in segment_tokens_list
+    )
+    if composite_side_effect and not strong_informational_path:
         return True
     action_query_keys = {"action", "command", "do", "method", "operation", "task"}
+
+    def query_part_has_side_effect(value: str) -> bool:
+        normalized = unquote(value).strip().casefold()
+        tokens = segment_tokens(normalized)
+        return bool(normalized in _SIDE_EFFECT_PATH_SEGMENTS or set(tokens) & _SIDE_EFFECT_PATH_SEGMENTS)
+
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
     if any(
-        key.casefold() in _SIDE_EFFECT_PATH_SEGMENTS
+        query_part_has_side_effect(key)
         or (
             key.casefold() in action_query_keys
-            and unquote(value).strip().casefold() in _SIDE_EFFECT_PATH_SEGMENTS
+            and query_part_has_side_effect(value)
         )
-        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        for key, value in query_pairs
     ):
         return True
+    informational_query = any(
+        key.casefold() in action_query_keys
+        and tokens_are_informational(segment_tokens(value))
+        and not query_part_has_side_effect(value)
+        for key, value in query_pairs
+    )
     informational = bool(
         _matches(_INFORMATIONAL_LINK_PATTERNS, target_line)
-        or segments & _INFORMATIONAL_PATH_SEGMENTS
+        or informational_path
+        or informational_composite
+        or informational_query
     )
     if informational:
         return False

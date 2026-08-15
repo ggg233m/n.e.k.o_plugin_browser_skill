@@ -18,7 +18,13 @@ def test_plugin_manifest_and_public_runtime_load() -> None:
     assert manifest["plugin"]["ui"]["panel"][0]["entry"] == "static/panel.html"
     assert manifest["plugin"]["version"] == "0.1.4"
     assert project["project"]["version"] == "0.1.4"
-    assert project["tool"]["neko"]["build"]["exclude_dirs"] == ["scripts", ".ruff_cache"]
+    assert project["tool"]["neko"]["build"]["exclude_dirs"] == [
+        "scripts",
+        "tests",
+        ".vscode",
+        ".ruff_cache",
+        ".package-tmp",
+    ]
     assert manifest["browser_skill"]["bsk_executable"] == "bundled"
     binary_manifest = json.loads((root / "bin" / "manifest.json").read_text(encoding="utf-8"))
     assert binary_manifest["version"] == bsk_client_module.BUNDLED_BSK_VERSION

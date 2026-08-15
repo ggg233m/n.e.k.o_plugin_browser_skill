@@ -16,6 +16,8 @@ from plugin.plugins.browser_skill.runtime.models import (
 from plugin.plugins.browser_skill.runtime.policy import (
     PolicyViolation,
     additional_agent_tab_requested,
+    critical_press_has_grounded_target,
+    grounded_critical_press_target,
     http_link_requires_confirmation,
     is_search_fill,
     is_sensitive_fill,
@@ -82,6 +84,17 @@ def test_password_fill_is_always_human_work() -> None:
     assert is_sensitive_fill(action, 'textbox "Password" @e7')
 
 
+def test_sensitive_fill_uses_reason_only_to_escalate_an_observed_target() -> None:
+    action = FillAction(
+        action="fill",
+        target="@e7",
+        value="ordinary nickname",
+        reason="Continue the password setup workflow",
+    )
+    assert is_sensitive_fill(action, 'textbox "昵称" @e7')
+    assert not is_sensitive_fill(action, 'textbox "Password" @e8')
+
+
 def test_fill_submit_is_limited_to_observed_search_fields() -> None:
     action = FillAction(action="fill", target="@e7", value="cats", submit=True)
     assert is_search_fill(action, 'textbox "搜索" @e7')
@@ -129,9 +142,9 @@ def test_critical_click_requires_confirmation() -> None:
 
 
 def test_observed_ref_matching_does_not_confuse_numeric_prefixes() -> None:
-    observation = 'textbox "Search" @e10; button "Delete" @e1'
+    observation = 'textbox "Search @e1 example" @e10; button "Delete" @e1'
     assert observed_target_control("@e1", observation) == 'button "Delete" @e1'
-    assert observed_target_control("@e10", observation) == 'textbox "Search" @e10'
+    assert observed_target_control("@e10", observation) == 'textbox "Search @e1 example" @e10'
     assert requires_critical_confirmation(
         ClickAction(action="click", target="@e1"),
         "删除这条内容",
@@ -165,6 +178,12 @@ def test_http_link_confirmation_preserves_document_navigation_exemption() -> Non
         'link "Delete account documentation" @e4',
         "https://example.com/docs/delete-account",
     )
+    assert not http_link_requires_confirmation(
+        ClickAction(action="click", target="@e4"),
+        "打开账户页面",
+        'link "Account information" @e4',
+        "https://example.com/docs/delete-account",
+    )
     assert http_link_requires_confirmation(
         ClickAction(action="click", target="@e4"),
         "删除这个项目",
@@ -177,11 +196,106 @@ def test_http_link_confirmation_preserves_document_navigation_exemption() -> Non
         'link "Logout" @e4',
         "https://example.com/account?action=logout",
     )
+    assert http_link_requires_confirmation(
+        ClickAction(action="click", target="@e4"),
+        "管理账户",
+        'link "Account settings" @e4',
+        "https://example.com/account/delete-account",
+    )
+    assert http_link_requires_confirmation(
+        ClickAction(action="click", target="@e4"),
+        "管理成员",
+        'link "Member settings" @e4',
+        "https://example.com/users/remove_member",
+    )
+    assert http_link_requires_confirmation(
+        ClickAction(action="click", target="@e4"),
+        "管理账户",
+        'link "Account settings" @e4',
+        "https://example.com/account?action=delete-account",
+    )
+    assert not http_link_requires_confirmation(
+        ClickAction(action="click", target="@e4"),
+        "阅读注销账户政策",
+        'link "Delete account policy" @e4',
+        "https://example.com/account/delete-account-policy",
+    )
+    assert http_link_requires_confirmation(
+        ClickAction(action="click", target="@e4"),
+        "阅读注销账户政策",
+        'link "Delete account policy" @e4',
+        "https://example.com/account?action=delete-account-policy",
+    )
+    assert http_link_requires_confirmation(
+        ClickAction(action="click", target="@e4"),
+        "管理文章",
+        'link "Article settings" @e4',
+        "https://example.com/admin/delete-article",
+    )
+    assert http_link_requires_confirmation(
+        ClickAction(action="click", target="@e4"),
+        "管理工单",
+        'link "Ticket settings" @e4',
+        "https://example.com/tickets/delete-support-ticket",
+    )
+    assert http_link_requires_confirmation(
+        ClickAction(action="click", target="@e4"),
+        "管理工单",
+        'link "Ticket settings" @e4',
+        "https://example.com/tickets?action=delete-support-ticket",
+    )
+    assert http_link_requires_confirmation(
+        ClickAction(action="click", target="@e4"),
+        "管理工单",
+        'link "Ticket settings" @e4',
+        "https://example.com/support/delete-ticket",
+    )
 
 
 def test_targetless_enter_confirms_only_with_clear_consequential_control() -> None:
     action = PressAction(action="press", key="Enter")
     assert requires_critical_confirmation(
+        action,
+        "发送这条消息",
+        'textbox "给 DeepSeek 发送消息" [focused] @e111',
+    )
+    assert critical_press_has_grounded_target(
+        action,
+        "发送这条消息",
+        'textbox "给 DeepSeek 发送消息" [focused] @e111',
+    )
+    assert grounded_critical_press_target(
+        action,
+        "发送这条消息",
+        'textbox "给 DeepSeek 发送消息" [focused] @e111',
+    ) == "@e111"
+    assert not critical_press_has_grounded_target(
+        action,
+        "发送这条消息",
+        'textbox "Type [focused] for help" @e111',
+    )
+    assert not critical_press_has_grounded_target(
+        action,
+        "发送这条消息",
+        'textbox "给 DeepSeek 发送消息" @e111',
+    )
+    assert not critical_press_has_grounded_target(
+        action,
+        "发送这条消息",
+        'textbox "消息" @e111\ntextbox "收件人" @e112',
+    )
+    assert not critical_press_has_grounded_target(
+        action,
+        "发送这条消息",
+        'textbox "消息" @e205',
+        recent_fill_target="@e111",
+    )
+    assert critical_press_has_grounded_target(
+        action,
+        "搜索 BrowserSkill",
+        'textbox "搜索" @e12',
+    )
+    assert not requires_critical_confirmation(
         action,
         "发送这条消息",
         'textbox "给 DeepSeek 发送消息" @e111',
@@ -222,7 +336,7 @@ def test_targetless_enter_confirms_only_with_clear_consequential_control() -> No
         'textbox "消息" @e111',
         recent_fill_target="@e111",
     )
-    assert requires_critical_confirmation(
+    assert not requires_critical_confirmation(
         action,
         "发送这条消息",
         'textbox "消息" @e205\ntextbox "收件人" @e206',
