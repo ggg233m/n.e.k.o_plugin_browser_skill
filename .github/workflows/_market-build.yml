@@ -18,8 +18,9 @@ on:
         type: boolean
         default: false
 
-permissions:
-  contents: write
+# Permissions are supplied by each caller. Verification callers can stay
+# read-only, while the release caller grants contents: write for the GitHub
+# Release step below.
 
 jobs:
   build:
