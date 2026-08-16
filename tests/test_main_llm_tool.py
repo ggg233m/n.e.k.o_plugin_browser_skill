@@ -5,6 +5,7 @@ from pathlib import Path
 from types import MethodType, SimpleNamespace
 from typing import Any
 
+import plugin.plugins.browser_skill as browser_skill_module
 import pytest
 from plugin.plugins.browser_skill import (
     BrowserSkillPlugin,
@@ -171,6 +172,11 @@ def test_auto_routing_adds_fallback_for_uncertain_native_routes() -> None:
     assert plugin._resolve_routing_mode() == "native"
     plugin._settings = SimpleNamespace(routing_mode="fallback")
     assert plugin._resolve_routing_mode() == "fallback"
+
+
+def test_missing_host_route_capability_uses_conservative_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(browser_skill_module, "_HOST_ROUTE_SUPPORTS_TOOL_CALLS", None)
+    assert browser_skill_module.route_supports_tool_calls("any-model", "https://example.com") is False
 
 
 def test_recoverable_failure_recommends_only_one_automatic_retry() -> None:

@@ -11,8 +11,25 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
-from main_logic.omni_offline_client import route_supports_tool_calls
+from main_logic import omni_offline_client as _omni_offline_client
 from plugin.sdk.plugin import NekoPluginBase, Ok, lifecycle, llm_tool, neko_plugin, plugin_entry, ui
+
+# ``route_supports_tool_calls`` was added to newer N.E.K.O host builds, but it
+# is not part of the plugin SDK contract.  Keep the plugin loadable on older
+# hosts and conservatively enable the host-driven fallback when the helper is
+# unavailable.  A callable exported by the host still remains authoritative.
+_HOST_ROUTE_SUPPORTS_TOOL_CALLS = getattr(
+    _omni_offline_client,
+    "route_supports_tool_calls",
+    None,
+)
+
+
+def route_supports_tool_calls(model: str, base_url: str | None) -> bool:
+    if callable(_HOST_ROUTE_SUPPORTS_TOOL_CALLS):
+        return bool(_HOST_ROUTE_SUPPORTS_TOOL_CALLS(model, base_url))
+    return False
+
 
 if __package__:
     from .runtime import (
