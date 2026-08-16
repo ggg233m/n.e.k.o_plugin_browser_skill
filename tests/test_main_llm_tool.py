@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 from typing import Any
@@ -179,6 +180,22 @@ def test_missing_host_route_capability_uses_conservative_fallback(monkeypatch: p
     assert browser_skill_module.route_supports_tool_calls("any-model", "https://example.com") is False
 
 
+def test_plugin_ephemeral_state_is_pruned_and_bounded() -> None:
+    plugin = object.__new__(BrowserSkillPlugin)
+    now = time.monotonic()
+    plugin._native_started_at = {"stale": (now - 120, "old")}
+    plugin._native_started_at.update({f"native-{index}": (now, "new") for index in range(513)})
+    plugin._fallback_started_at = {f"fallback-{index}": (now, "new") for index in range(513)}
+    plugin._recovery_attempts = {f"recovery-{index}": ("request", 1) for index in range(513)}
+
+    plugin._prune_ephemeral_state()
+
+    assert "stale" not in plugin._native_started_at
+    assert len(plugin._native_started_at) <= 512
+    assert len(plugin._fallback_started_at) <= 512
+    assert len(plugin._recovery_attempts) <= 512
+
+
 def test_recoverable_failure_recommends_only_one_automatic_retry() -> None:
     plugin = object.__new__(BrowserSkillPlugin)
     plugin._recovery_attempts = {}
@@ -326,6 +343,28 @@ async def test_native_tool_starts_long_run_in_background() -> None:
     assert terminal_text.index("page and free text excluded") < terminal_text.index(
         "private page body"
     )
+
+
+@pytest.mark.asyncio
+async def test_native_background_exception_emits_failure_terminal_result() -> None:
+    plugin = _plugin()
+
+    async def failing_run(self: BrowserSkillPlugin, **_kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("simulated host failure")
+
+    plugin.run_browser_task = MethodType(failing_run, plugin)
+
+    await plugin._run_direct_background(
+        instruction="搜索小猫视频",
+        start_url=None,
+        final_session_action="defer",
+        context={"lanlan_name": "然然"},
+    )
+
+    assert len(plugin.pushed) == 1
+    terminal_text = plugin.pushed[0]["parts"][0]["text"]
+    assert '"authoritative_outcome":"failure"' in terminal_text
+    assert '"code":"BACKGROUND_TASK_FAILED"' in terminal_text
 
 
 @pytest.mark.asyncio

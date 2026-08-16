@@ -8,9 +8,13 @@ from typing import Any
 import pytest
 from plugin.plugins.browser_skill.runtime.agent_loop import AgentLoop, LoopFailure
 from plugin.plugins.browser_skill.runtime.bsk_client import BskCommandError, BskCommandResult
-from plugin.plugins.browser_skill.runtime.control import BrowserTaskControl
+from plugin.plugins.browser_skill.runtime.control import (
+    BrowserTaskControl,
+    BrowserTaskController,
+)
 from plugin.plugins.browser_skill.runtime.models import (
     BorrowTabAction,
+    BrowserTaskResult,
     ClickAction,
     DoneAction,
     FailAction,
@@ -231,6 +235,28 @@ def make_loop(
         settings=settings or RuntimeSettings(max_steps=10, session_keepalive_seconds=0),
         prompts_dir=Path(__file__).parent.parent / "prompts",
     )
+
+
+def test_controller_terminal_history_is_bounded() -> None:
+    controller = BrowserTaskController()
+    result = BrowserTaskResult(
+        success=False,
+        status="failed",
+        summary="失败",
+        session_state="closed",
+    )
+
+    for index in range(controller._MAX_LAST_CONTROLS + 1):
+        control = controller.start(
+            conversation_id=f"chat-{index}",
+            goal="检查页面",
+            original_request="检查页面",
+        )
+        controller.finish(control, result)
+
+    assert len(controller._last) == controller._MAX_LAST_CONTROLS
+    assert "chat-0" not in controller._last
+    assert f"chat-{controller._MAX_LAST_CONTROLS}" in controller._last
 
 
 @pytest.mark.asyncio

@@ -200,6 +200,9 @@ def test_error_mapping_and_redaction() -> None:
     assert "abc123" not in str(error)
     assert "hunter2" not in error.hint
     assert redact_text("cookie=session-value") == "cookie=<redacted>"
+    assert redact_text('{"token":"json-secret"}') == '{"token":"<redacted>"}'
+    assert redact_text('password: "secret with spaces"') == 'password: "<redacted>"'
+    assert redact_text("Authorization: Bearer bearer-secret") == "Authorization: <redacted>"
 
     busy = BskCommandError(
         BskCommandResult(

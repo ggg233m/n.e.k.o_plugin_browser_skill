@@ -326,6 +326,9 @@ _FALLBACK_SCHEMA: dict[str, Any] = {
     "required": ["instruction"],
 }
 
+_EPHEMERAL_STATE_MAX_ENTRIES = 512
+_EPHEMERAL_STATE_TTL_SECONDS = 60.0
+
 def _clamp_tab_count(value: Any) -> int:
     try:
         return min(10, max(1, int(value)))
@@ -398,6 +401,31 @@ class BrowserSkillPlugin(NekoPluginBase):
                 }
             )
 
+    def _prune_ephemeral_state(self) -> None:
+        """Bound per-conversation routing and recovery state for long-lived plugins."""
+        now = time.monotonic()
+        for attribute in ("_native_started_at", "_fallback_started_at"):
+            mapping = getattr(self, attribute, None)
+            if not isinstance(mapping, dict):
+                continue
+            stale = [
+                key
+                for key, value in mapping.items()
+                if isinstance(value, tuple)
+                and value
+                and isinstance(value[0], (int, float))
+                and now - float(value[0]) > _EPHEMERAL_STATE_TTL_SECONDS
+            ]
+            for key in stale:
+                mapping.pop(key, None)
+            while len(mapping) > _EPHEMERAL_STATE_MAX_ENTRIES:
+                mapping.pop(next(iter(mapping)), None)
+
+        attempts = getattr(self, "_recovery_attempts", None)
+        if isinstance(attempts, dict):
+            while len(attempts) > _EPHEMERAL_STATE_MAX_ENTRIES:
+                attempts.pop(next(iter(attempts)), None)
+
     async def _inspect_page(
         self,
         conversation_id: str | None,
@@ -429,6 +457,7 @@ class BrowserSkillPlugin(NekoPluginBase):
         task_key: str,
         request_fingerprint: str,
     ) -> None:
+        self._prune_ephemeral_state()
         error = data.get("error") if isinstance(data.get("error"), dict) else {}
         recoverable = bool(
             data.get("success") is False
@@ -452,6 +481,7 @@ class BrowserSkillPlugin(NekoPluginBase):
             count = 0
         recommended = recoverable and count < 1
         if recommended:
+            attempts.pop(task_key, None)
             attempts[task_key] = (request_fingerprint, count + 1)
         data["recovery_recommended"] = recommended
         if recommended:
@@ -660,6 +690,7 @@ class BrowserSkillPlugin(NekoPluginBase):
             self._start_preflight_in_background()
 
     async def _run_browser_task_fallback(self, **kwargs: Any):
+        self._prune_ephemeral_state()
         context = kwargs.get("_ctx") if isinstance(kwargs.get("_ctx"), dict) else {}
         conversation_id = _browser_session_key(context, scope=self._settings.session_scope)
         task_key = conversation_id or "browser-skill:main-dialog"
@@ -702,6 +733,7 @@ class BrowserSkillPlugin(NekoPluginBase):
         fallback_starts = getattr(self, "_fallback_started_at", None)
         if fallback_starts is None:
             fallback_starts = self._fallback_started_at = {}
+        fallback_starts.pop(task_key, None)
         fallback_starts[task_key] = (time.monotonic(), fingerprint)
         return await self.run_browser_task(**kwargs)
 
@@ -741,13 +773,37 @@ class BrowserSkillPlugin(NekoPluginBase):
             try:
                 done.result()
             except Exception as exc:
-                self.logger.exception(
+                self.logger.warning(
                     "BrowserSkill direct tool background task failed: {}",
                     type(exc).__name__,
                 )
 
         task.add_done_callback(finished)
         return task
+
+    @staticmethod
+    def _direct_background_failure(error_type: str) -> dict[str, Any]:
+        """Build a bounded terminal payload when the background path itself fails."""
+        return {
+            "success": False,
+            "status": "failed",
+            "authoritative_outcome": "failure",
+            "summary": "BrowserSkill 后台任务未能返回终态",
+            "details": "后台执行发生异常，未能取得可用的浏览器结果。",
+            "session_state": "closed",
+            "continuation_available": False,
+            "session_decision_required": False,
+            "completion_source": "plugin_background_error",
+            "warnings": [],
+            "recovery_recommended": False,
+            "recovery_reason": "",
+            "error": {
+                "code": "BACKGROUND_TASK_FAILED",
+                "message": "BrowserSkill 后台任务异常终止",
+                "hint": error_type[:120],
+                "retryable": True,
+            },
+        }
 
     async def _run_direct_background(
         self,
@@ -759,15 +815,27 @@ class BrowserSkillPlugin(NekoPluginBase):
         context: dict[str, Any],
     ) -> Any:
         """Run the long task and explicitly wake the dialog LLM at terminal state."""
-        envelope = await self.run_browser_task(
-            instruction=instruction,
-            start_url=start_url,
-            update_mode="auto",
-            final_session_action=final_session_action,
-            requested_tab_count=tab_count,
-            _ctx=context,
-        )
+        try:
+            envelope = await self.run_browser_task(
+                instruction=instruction,
+                start_url=start_url,
+                update_mode="auto",
+                final_session_action=final_session_action,
+                requested_tab_count=tab_count,
+                _ctx=context,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.logger.warning(
+                "BrowserSkill direct background execution failed: {}",
+                type(exc).__name__,
+            )
+            envelope = {"data": self._direct_background_failure(type(exc).__name__)}
         data = envelope.get("data") if isinstance(envelope, dict) else None
+        if not isinstance(data, dict):
+            data = self._direct_background_failure("INVALID_TERMINAL_ENVELOPE")
+            envelope = {"data": data}
         if isinstance(data, dict):
             allowed = (
                 "success",
@@ -795,10 +863,23 @@ class BrowserSkillPlugin(NekoPluginBase):
             )
             page = data.get("page") if isinstance(data.get("page"), dict) else None
             if page is None:
-                page = await self._inspect_page(
-                    conversation_id,
-                    refresh=True,
-                )
+                try:
+                    page = await self._inspect_page(
+                        conversation_id,
+                        refresh=True,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.logger.warning(
+                        "BrowserSkill terminal page inspection failed: {}",
+                        type(exc).__name__,
+                    )
+                    page = {
+                        "available": False,
+                        "reason": "PAGE_INSPECTION_UNAVAILABLE",
+                        "content_trust": "untrusted_page_data",
+                    }
             target_lanlan = str(context.get("lanlan_name") or "").strip() or None
             recovery_recommended = terminal.get("recovery_recommended") is True
             outcome = str(terminal.get("authoritative_outcome") or "").strip()
@@ -1186,6 +1267,7 @@ class BrowserSkillPlugin(NekoPluginBase):
         **_: Any,
     ):
         """Native main-dialog tool surface; long runs stay in plugin background."""
+        self._prune_ephemeral_state()
         context = self._direct_tool_context(_ctx)
         context["invocation_source"] = "main_llm_tool"
         conversation_id = _browser_session_key(
@@ -1334,6 +1416,7 @@ class BrowserSkillPlugin(NekoPluginBase):
         native_starts = getattr(self, "_native_started_at", None)
         if native_starts is None:
             native_starts = self._native_started_at = {}
+        native_starts.pop(task_key, None)
         native_starts[task_key] = (time.monotonic(), fingerprint)
         # Let run_browser_task register its BrowserTaskControl before a
         # near-simultaneous second tool call attempts to steer it.

@@ -22,8 +22,16 @@ from typing import Any, Iterable
 from .models import Availability, BrowserInfo
 
 _SECRET_RE = re.compile(
-    r"(?i)(password|passwd|passcode|token|secret|api[_-]?key|authorization|cookie)"
-    r"\s*[:=]\s*([^\s,;]+)"
+    r"(?ixs)"
+    r"(?P<prefix>"
+    r"(?P<key_quote>[\"']?)"
+    r"(?:password|passwd|passcode|token|secret|api[_-]?key|authorization|cookie)"
+    r"(?P=key_quote)\s*[:=]\s*"
+    r")"
+    r"(?:"
+    r"(?P<value_quote>[\"'])(?P<quoted_value>.*?)(?P=value_quote)"
+    r"|(?P<bare_value>[^,;}&\]\r\n]+)"
+    r")"
 )
 
 BUNDLED_BSK_SELECTOR = "bundled"
@@ -111,7 +119,12 @@ def resolve_bundled_executable(platform_key: str | None = None) -> str | None:
 
 
 def redact_text(value: str, *, limit: int = 2000) -> str:
-    text = _SECRET_RE.sub(r"\1=<redacted>", str(value or ""))
+    def replace_secret(match: re.Match[str]) -> str:
+        prefix = match.group("prefix")
+        quote = match.group("value_quote") or ""
+        return f"{prefix}{quote}<redacted>{quote}"
+
+    text = _SECRET_RE.sub(replace_secret, str(value or ""))
     return text[:limit]
 
 

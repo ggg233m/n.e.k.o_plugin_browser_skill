@@ -169,9 +169,17 @@ class BrowserTaskControl:
 
 
 class BrowserTaskController:
+    _MAX_LAST_CONTROLS = 512
+
     def __init__(self) -> None:
         self._active: dict[str, BrowserTaskControl] = {}
         self._last: dict[str, BrowserTaskControl] = {}
+
+    def _remember_last(self, control: BrowserTaskControl) -> None:
+        self._last.pop(control.conversation_id, None)
+        self._last[control.conversation_id] = control
+        while len(self._last) > self._MAX_LAST_CONTROLS:
+            self._last.pop(next(iter(self._last)), None)
 
     @staticmethod
     def key(conversation_id: str | None) -> str:
@@ -217,7 +225,7 @@ class BrowserTaskController:
         control.update_url(result.current_url or control.current_url)
         if self._active.get(control.conversation_id) is control:
             self._active.pop(control.conversation_id, None)
-        self._last[control.conversation_id] = control
+        self._remember_last(control)
 
     def finish_cancelled(self, control: BrowserTaskControl) -> None:
         control.active = False
@@ -227,7 +235,7 @@ class BrowserTaskController:
         control.current_action = ""
         if self._active.get(control.conversation_id) is control:
             self._active.pop(control.conversation_id, None)
-        self._last[control.conversation_id] = control
+        self._remember_last(control)
 
     def finish_failed(self, control: BrowserTaskControl, summary: str) -> None:
         control.active = False
@@ -237,7 +245,7 @@ class BrowserTaskController:
         control.current_action = ""
         if self._active.get(control.conversation_id) is control:
             self._active.pop(control.conversation_id, None)
-        self._last[control.conversation_id] = control
+        self._remember_last(control)
 
     def status(self, conversation_id: str | None) -> dict[str, object]:
         control = self.get_active(conversation_id)
