@@ -458,6 +458,10 @@ class BrowserSkillPlugin(NekoPluginBase):
         base = dict(raw_settings) if isinstance(raw_settings, dict) else {}
         local = await asyncio.to_thread(_read_local_settings, self._local_settings_path())
         merged = {**base, **local}
+        # ``allow_evaluate`` never had an executable action behind it. Drop the
+        # retired no-op key so settings saved by older versions still load under
+        # the strict RuntimeSettings schema.
+        merged.pop("allow_evaluate", None)
         configured_bsk = str(merged.get("bsk_executable") or "").replace("\\", "/").casefold()
         if configured_bsk == "bin/bsk.exe" or configured_bsk.endswith(
             "/bsk-v0.1.9-x86_64-pc-windows-msvc/bsk.exe"

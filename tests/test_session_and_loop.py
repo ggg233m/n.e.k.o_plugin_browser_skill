@@ -193,6 +193,32 @@ class FakeBsk:
         return {"tab_id": tab_id}
 
 
+class IdleHelpClient:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def request_help(self, session_id: str, **kwargs: Any) -> dict[str, Any]:
+        assert session_id == "s-1"
+        assert kwargs["timeout_seconds"] == 86400
+        self.started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        return {}
+
+
+class HandoffBsk(FakeBsk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.peer = IdleHelpClient()
+
+    def spawn_peer(self) -> IdleHelpClient:
+        return self.peer
+
+
 def make_loop(
     client: FakeBsk,
     sessions: SessionManager,
@@ -328,30 +354,6 @@ async def test_terminated_task_can_preserve_and_reuse_the_same_session() -> None
 
 @pytest.mark.asyncio
 async def test_idle_session_releases_to_user_and_next_task_reacquires() -> None:
-    class IdleHelpClient:
-        def __init__(self) -> None:
-            self.started = asyncio.Event()
-            self.cancelled = asyncio.Event()
-
-        async def request_help(self, session_id: str, **kwargs: Any) -> dict[str, Any]:
-            assert session_id == "s-1"
-            assert kwargs["timeout_seconds"] == 86400
-            self.started.set()
-            try:
-                await asyncio.Future()
-            except asyncio.CancelledError:
-                self.cancelled.set()
-                raise
-            return {}
-
-    class HandoffBsk(FakeBsk):
-        def __init__(self) -> None:
-            super().__init__()
-            self.peer = IdleHelpClient()
-
-        def spawn_peer(self) -> IdleHelpClient:
-            return self.peer
-
     client = HandoffBsk()
     sessions = SessionManager(client)  # type: ignore[arg-type]
     first = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
@@ -370,6 +372,33 @@ async def test_idle_session_releases_to_user_and_next_task_reacquires() -> None:
     assert reused.control_owner == "agent"
     assert client.peer.cancelled.is_set()
     assert client.started == 1
+    assert client.stopped == []
+
+
+@pytest.mark.asyncio
+async def test_dead_idle_session_cancels_handoff_without_closing_browser() -> None:
+    client = HandoffBsk()
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    first = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    await sessions.preserve_session(
+        first,
+        interval_seconds=120,
+        release_control=True,
+    )
+    await asyncio.wait_for(client.peer.started.wait(), timeout=1)
+
+    # Simulate BrowserSkill reporting that the old session disappeared while
+    # its idle request-help peer is still waiting for user control.
+    client.session_ids.clear()
+    replacement = await sessions.get_or_create(
+        conversation_id="chat-1",
+        browser_id="browser-1",
+    )
+
+    assert replacement is not first
+    assert replacement.bsk_session_id == "s-2"
+    assert client.peer.cancelled.is_set()
+    assert client.started == 2
     assert client.stopped == []
 
 
@@ -419,6 +448,29 @@ async def test_loop_navigates_verifies_and_keeps_reusable_session() -> None:
     assert result.current_url == "https://example.com/result"
     assert client.snapshot_counter >= 2
     assert client.stopped == []
+
+
+@pytest.mark.asyncio
+async def test_side_effect_start_url_is_confirmed_before_initial_navigation() -> None:
+    client = FakeBsk()
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    planner = FakePlanner(
+        DoneAction(action="done", summary="已退出登录"),
+        DoneAction(action="done", summary="已复核退出状态"),
+    )
+
+    result = await make_loop(client, sessions).run(
+        instruction="退出登录",
+        raw_request="退出登录",
+        start_url="https://example.com/account/logout",
+        session=session,
+        planner=planner,
+    )
+
+    assert result.success is True
+    assert client.help_count == 1
+    assert client.url == "https://example.com/account/logout"
 
 
 @pytest.mark.asyncio
@@ -1353,6 +1405,109 @@ async def test_critical_targetless_enter_without_focus_is_rejected() -> None:
 
     assert client.help_count == 0
     assert client.pressed == []
+
+
+@pytest.mark.asyncio
+async def test_targeted_enter_on_critical_button_is_confirmed_before_press() -> None:
+    client = FakeBsk()
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+
+    await make_loop(client, sessions)._execute_action(
+        PressAction(action="press", key="Enter", target="@e9"),
+        instruction="购买这个商品",
+        observation='button "提交订单" [focused] @e9',
+        observation_level=1,
+        session=session,
+        vision=None,  # type: ignore[arg-type]
+        progress=None,
+        step=1,
+        control=None,
+        planned_revision=0,
+    )
+
+    assert client.help_count == 1
+    assert client.pressed == [("Enter", "@e9")]
+
+
+@pytest.mark.asyncio
+async def test_direct_side_effect_urls_are_confirmed_for_navigation_and_tabs() -> None:
+    client = FakeBsk()
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    loop = make_loop(
+        client,
+        sessions,
+        RuntimeSettings(
+            max_steps=10,
+            session_keepalive_seconds=0,
+            allow_additional_agent_tabs=True,
+        ),
+    )
+
+    await loop._execute_action(
+        NavigateAction(action="navigate", url="https://example.com/account/logout"),
+        instruction="退出登录",
+        observation="page",
+        observation_level=1,
+        session=session,
+        vision=None,  # type: ignore[arg-type]
+        progress=None,
+        step=1,
+        control=None,
+        planned_revision=0,
+    )
+    await loop._execute_action(
+        TabCreateAction(action="tab_create", url="https://example.com/chat/send-message"),
+        instruction="在另一个标签页发送消息",
+        observation="page",
+        observation_level=1,
+        session=session,
+        vision=None,  # type: ignore[arg-type]
+        progress=None,
+        step=2,
+        control=None,
+        planned_revision=0,
+    )
+
+    assert client.help_count == 2
+    assert client.created_tabs == ["https://example.com/chat/send-message"]
+
+
+@pytest.mark.asyncio
+async def test_direct_url_confirmation_shows_action_without_query_secrets() -> None:
+    client = FakeBsk()
+    prompts: list[str] = []
+
+    async def capture_help(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        prompts.append(str(kwargs.get("prompt") or ""))
+        return {"outcome": "completed"}
+
+    client.request_help = capture_help  # type: ignore[method-assign]
+    sessions = SessionManager(client)  # type: ignore[arg-type]
+    session = await sessions.get_or_create(conversation_id="chat-1", browser_id="browser-1")
+    loop = make_loop(client, sessions)
+
+    await loop._execute_action(
+        NavigateAction(
+            action="navigate",
+            url="https://example.com/account?action=logout&token=secret-value",
+        ),
+        instruction="退出登录",
+        observation="page",
+        observation_level=1,
+        session=session,
+        vision=None,  # type: ignore[arg-type]
+        progress=None,
+        step=1,
+        control=None,
+        planned_revision=0,
+    )
+
+    assert len(prompts) == 1
+    assert "action=logout" in prompts[0]
+    assert "token" not in prompts[0]
+    assert "secret-value" not in prompts[0]
 
 
 @pytest.mark.asyncio

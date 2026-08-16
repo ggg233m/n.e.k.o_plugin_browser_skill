@@ -118,7 +118,8 @@ uv run python -m plugin.neko_plugin_cli.cli build n.e.k.o_plugin_browser_skill -
 
 If the plugin is outside the N.E.K.O source tree, replace `n.e.k.o_plugin_browser_skill`
 with its absolute path. CI uses the same upstream builder, and `[tool.neko.build]`
-excludes `scripts/` from the final archive.
+excludes development-only `scripts/`, `tests/`, `.vscode/`, `.ruff_cache/`,
+`.package-tmp/`, `.gitignore`, and `ruff.toml` from the final archive.
 
 ## Console and execution policy
 

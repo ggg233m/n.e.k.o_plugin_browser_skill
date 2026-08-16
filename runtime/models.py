@@ -79,7 +79,6 @@ class RuntimeSettings(StrictModel):
     html_max_bytes: int = Field(default=65536, ge=1024, le=524288)
     allow_tab_borrow: bool = True
     enable_vision_fallback: bool = True
-    allow_evaluate: bool = False
     keep_session_for_media: bool = True
     debug_logging: bool = True
 

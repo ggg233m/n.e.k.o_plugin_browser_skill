@@ -115,6 +115,11 @@ class SessionManager:
                     session=self._tag(existing.bsk_session_id),
                 )
                 return existing
+            # A session that disappeared from daemon status can still have a
+            # long-running idle request-help peer. Cancel that handoff before
+            # forgetting the stale session; this releases only the handoff and
+            # does not issue session stop or close the browser window.
+            await self.stop_idle_handoff(existing)
             await self.stop_keepalive(existing)
             self._sessions.pop(key, None)
 

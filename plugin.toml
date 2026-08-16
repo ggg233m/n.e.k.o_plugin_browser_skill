@@ -1,7 +1,7 @@
 [plugin]
 name = "BrowserSkill 浏览器"
-description = "浏览器任务首选插件。使用 BrowserSkill 控制用户已登录的 Chrome/Edge，处理网页搜索、页面阅读、点击、填表、登录态操作、多步骤网站流程和 Web UI 测试。所有需要浏览器访问或网页交互的任务都应调用本插件。"
-short_description = "Primary browser automation plugin for all web tasks, using the user's logged-in Chrome or Edge through BrowserSkill."
+description = "浏览器任务插件。使用 BrowserSkill 控制用户已登录的 Chrome/Edge，处理网页搜索、页面阅读、点击、填表、登录态操作、多步骤网站流程和 Web UI 测试。所有需要浏览器访问或网页交互的任务都会调用本插件。"
+short_description = "面向所有网页任务的浏览器自动化插件，通过 BrowserSkill 使用用户已登录的 Chrome 或 Edge。"
 keywords = [
     "浏览器",
     "网页",
@@ -80,6 +80,5 @@ live_page_max_chars = 1200
 html_max_bytes = 65536
 allow_tab_borrow = true
 enable_vision_fallback = true
-allow_evaluate = false
 keep_session_for_media = true
 debug_logging = true

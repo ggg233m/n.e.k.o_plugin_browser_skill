@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 from typing import Any
 
@@ -75,6 +76,25 @@ def _plugin() -> BrowserSkillPlugin:
 
     plugin.push_message = MethodType(fake_push, plugin)
     return plugin
+
+
+@pytest.mark.asyncio
+async def test_legacy_allow_evaluate_setting_is_ignored(tmp_path: Path) -> None:
+    class LegacyConfig:
+        async def dump(self, **_kwargs: Any) -> dict[str, Any]:
+            return {"browser_skill": {"allow_evaluate": True}}
+
+    plugin = object.__new__(BrowserSkillPlugin)
+    plugin.config = LegacyConfig()
+    plugin.logger = _Logger()
+    plugin._local_settings_path = MethodType(  # type: ignore[method-assign]
+        lambda _self: tmp_path / "missing-settings.json",
+        plugin,
+    )
+
+    settings = await plugin._load_effective_settings()
+
+    assert "allow_evaluate" not in settings.model_dump()
 
 
 def test_browser_skill_exposes_one_native_main_llm_tool() -> None:

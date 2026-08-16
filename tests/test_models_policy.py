@@ -19,6 +19,8 @@ from plugin.plugins.browser_skill.runtime.policy import (
     critical_press_has_grounded_target,
     grounded_critical_press_target,
     http_link_requires_confirmation,
+    http_url_confirmation_query,
+    http_url_requires_confirmation,
     is_search_fill,
     is_sensitive_fill,
     observed_controls_match,
@@ -252,6 +254,28 @@ def test_http_link_confirmation_preserves_document_navigation_exemption() -> Non
     )
 
 
+def test_direct_http_url_confirmation_cannot_be_bypassed_by_action_type() -> None:
+    assert http_url_requires_confirmation("https://example.com/account/logout")
+    assert http_url_requires_confirmation("https://example.com/account/confirm-order")
+    assert http_url_requires_confirmation("https://example.com/chat?action=send-message")
+    assert not http_url_requires_confirmation("https://example.com/docs/delete-account")
+    assert not http_url_requires_confirmation("https://example.com/account/profile")
+
+
+def test_direct_http_url_confirmation_query_hint_is_informative_but_redacted() -> None:
+    assert (
+        http_url_confirmation_query(
+            "https://example.com/account?action=logout&token=secret-value"
+        )
+        == "action=logout"
+    )
+    assert (
+        http_url_confirmation_query("https://example.com/account?delete=1")
+        == "delete=<redacted>"
+    )
+    assert http_url_confirmation_query("https://example.com/account?token=secret-value") == ""
+
+
 def test_targetless_enter_confirms_only_with_clear_consequential_control() -> None:
     action = PressAction(action="press", key="Enter")
     assert requires_critical_confirmation(
@@ -329,6 +353,11 @@ def test_targetless_enter_confirms_only_with_clear_consequential_control() -> No
         PressAction(action="press", key="Enter", target="@e111"),
         "发送这条消息",
         'textbox "消息" @e111',
+    )
+    assert requires_critical_confirmation(
+        PressAction(action="press", key="Enter", target="@e9"),
+        "购买这个商品",
+        'button "Purchase" [focused] @e9',
     )
     assert requires_critical_confirmation(
         action,

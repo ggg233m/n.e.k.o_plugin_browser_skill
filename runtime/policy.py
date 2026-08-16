@@ -127,20 +127,31 @@ _SIDE_EFFECT_PATH_SEGMENTS = {
     "buy",
     "cancel",
     "checkout",
+    "confirm",
     "deactivate",
     "delete",
     "destroy",
     "download",
+    "grant",
+    "install",
     "logout",
     "pay",
+    "publish",
     "purchase",
     "remove",
     "revoke",
+    "save",
+    "send",
     "signout",
     "submit",
     "transfer",
     "unsubscribe",
+    "upload",
 }
+_ACTION_QUERY_KEYS = frozenset(
+    {"action", "command", "do", "method", "operation", "task"}
+)
+_SAFE_QUERY_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,47}$")
 
 
 class PolicyViolation(ValueError):
@@ -387,7 +398,11 @@ def requires_critical_confirmation(
             return False
 
     if not _TEXT_ENTRY_CONTROL_PATTERN.search(target_line):
-        return False
+        # A targeted Enter can activate buttons and links just like a click.
+        # Once the user's instruction is consequential, an observed explicit
+        # target must not become a confirmation bypass merely because it is not
+        # a text-entry control.
+        return action_has_observed_target
     if _matches(_CRITICAL_PATTERNS + _CONSEQUENTIAL_TEXT_ENTRY_PATTERNS, target_line):
         return True
     # A generic field is confirmed only when Enter is tied to an observed
@@ -396,18 +411,14 @@ def requires_critical_confirmation(
     return action_has_observed_target or selected_from_recent_fill or selected_from_observed_focus
 
 
-def http_link_requires_confirmation(
-    action: ClickAction,
-    instruction: str,
-    observation: str,
-    resolved_url: str,
-) -> bool:
-    """判断 HTTP(S) 链接是否需要确认，避免把普通动作词都当成副作用。"""
-    target_line = observed_target_control(action.target, observation)
+def _http_url_policy(resolved_url: str) -> tuple[bool, bool]:
+    """Return ``(side_effect, informational)`` for an HTTP(S) route."""
     try:
         parsed = urlsplit(resolved_url)
     except ValueError:
-        return True
+        return True, False
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+        return True, False
     segments = [
         unquote(part).strip().casefold()
         for part in parsed.path.split("/")
@@ -436,7 +447,7 @@ def http_link_requires_confirmation(
     # 例如 /docs/delete-account 中的 delete-account 不是独立端点动词，
     # 因此仍按信息页面处理；但 /docs/delete 仍然需要确认。
     if segment_set & _SIDE_EFFECT_PATH_SEGMENTS:
-        return True
+        return True, False
     # Web 框架常把端点动作写成复合词，而不是独立路径段
     # （例如 ``/account/delete-account``、``/users/remove_member``）。
     # 这里识别这类路径，同时避免把说明性文档 URL 当成副作用：
@@ -454,9 +465,7 @@ def http_link_requires_confirmation(
         for tokens in segment_tokens_list
     )
     if composite_side_effect and not strong_informational_path:
-        return True
-    action_query_keys = {"action", "command", "do", "method", "operation", "task"}
-
+        return True, False
     def query_part_has_side_effect(value: str) -> bool:
         normalized = unquote(value).strip().casefold()
         tokens = segment_tokens(normalized)
@@ -466,23 +475,70 @@ def http_link_requires_confirmation(
     if any(
         query_part_has_side_effect(key)
         or (
-            key.casefold() in action_query_keys
+            key.casefold() in _ACTION_QUERY_KEYS
             and query_part_has_side_effect(value)
         )
         for key, value in query_pairs
     ):
-        return True
+        return True, False
     informational_query = any(
-        key.casefold() in action_query_keys
+        key.casefold() in _ACTION_QUERY_KEYS
         and tokens_are_informational(segment_tokens(value))
         and not query_part_has_side_effect(value)
         for key, value in query_pairs
     )
+    informational = bool(informational_path or informational_composite or informational_query)
+    return False, informational
+
+
+def http_url_requires_confirmation(resolved_url: str) -> bool:
+    """Classify a direct URL without relying on a model-selected action type."""
+    side_effect, _ = _http_url_policy(resolved_url)
+    return side_effect
+
+
+def http_url_confirmation_query(resolved_url: str) -> str:
+    """Return a safe query hint for a direct side-effect URL confirmation."""
+    try:
+        parsed = urlsplit(resolved_url)
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    except (TypeError, ValueError, UnicodeError):
+        return ""
+
+    hints: list[str] = []
+    for key, value in query_pairs:
+        normalized_key = unquote(key).strip().casefold()
+        if normalized_key not in _SIDE_EFFECT_PATH_SEGMENTS and normalized_key not in _ACTION_QUERY_KEYS:
+            continue
+        if normalized_key in _ACTION_QUERY_KEYS:
+            normalized_value = unquote(value).strip()
+            rendered_value = (
+                normalized_value
+                if _SAFE_QUERY_VALUE.fullmatch(normalized_value)
+                else "<redacted>"
+            )
+        else:
+            rendered_value = "<redacted>"
+        hints.append(f"{normalized_key}={rendered_value}")
+        if len(hints) >= 3:
+            break
+    return "&".join(hints)
+
+
+def http_link_requires_confirmation(
+    action: ClickAction,
+    instruction: str,
+    observation: str,
+    resolved_url: str,
+) -> bool:
+    """判断 HTTP(S) 链接是否需要确认，避免把普通动作词都当成副作用。"""
+    target_line = observed_target_control(action.target, observation)
+    side_effect, informational_url = _http_url_policy(resolved_url)
+    if side_effect:
+        return True
     informational = bool(
         _matches(_INFORMATIONAL_LINK_PATTERNS, target_line)
-        or informational_path
-        or informational_composite
-        or informational_query
+        or informational_url
     )
     if informational:
         return False

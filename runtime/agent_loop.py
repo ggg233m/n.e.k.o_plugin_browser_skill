@@ -59,6 +59,8 @@ from .policy import (
     critical_press_has_grounded_target,
     grounded_critical_press_target,
     http_link_requires_confirmation,
+    http_url_confirmation_query,
+    http_url_requires_confirmation,
     is_search_fill,
     is_sensitive_fill,
     observed_controls_match,
@@ -314,17 +316,6 @@ class ViewportPosition:
             if not hit_top:
                 self.relative_viewports -= 1
             self.bottom_state = "not_at_bottom"
-        elif action.direction == "top":
-            self.relative_viewports = 0
-            self.top_state = "known"
-            self.bottom_state = "not_at_bottom"
-            self.position_mode = "relative_from_top"
-            self.position_reason = "explicit_home"
-        else:
-            self.relative_viewports = 0
-            self.position_mode = "relative_from_bottom"
-            self.position_reason = "explicit_end"
-            self.bottom_state = "known"
         if hit_top:
             self.relative_viewports = 0
             self.top_state = "known"
@@ -336,12 +327,6 @@ class ViewportPosition:
     def decorate(self, observation: str) -> str:
         if self.position_mode == "relative_from_top":
             relative = f"top{self.relative_viewports:+d}"
-        elif self.position_mode == "relative_from_bottom":
-            relative = (
-                "bottom+0"
-                if self.relative_viewports == 0
-                else f"bottom{self.relative_viewports:+d}"
-            )
         elif self.position_mode == "relative_from_observation":
             relative = f"observed{self.relative_viewports:+d}"
         else:
@@ -1375,12 +1360,38 @@ class AgentLoop:
                 control.update_url(current_url)
             if start_url:
                 validate_action(NavigateAction(action="navigate", url=start_url))
-                nav = await self.client.navigate(session.bsk_session_id, start_url)
-                current_url = self._extract_url(nav) or current_url
-                session.current_url = current_url
-                if control is not None:
-                    control.update_url(current_url)
-                viewport.reset(at_top=True, reason="start_url_navigation")
+                planned_revision = control.revision if control is not None else 0
+                confirmation = await self._confirm_direct_url(
+                    start_url,
+                    session=session,
+                    progress=progress,
+                    step=0,
+                )
+                confirmation_invalidated = bool(
+                    confirmation
+                    and (
+                        confirmation == "navigated"
+                        or (control is not None and control.revision != planned_revision)
+                    )
+                )
+                if confirmation_invalidated:
+                    tabs = await self.client.tab_list(session.bsk_session_id, scope="agent")
+                    current_url, session.current_tab_id = self._active_tab_state(tabs)
+                    session.current_url = current_url
+                    session.current_title = self._active_tab_title(tabs)
+                    if control is not None:
+                        control.update_url(current_url)
+                    viewport.reset(
+                        at_top=False,
+                        reason="start_url_confirmation_invalidated",
+                    )
+                else:
+                    nav = await self.client.navigate(session.bsk_session_id, start_url)
+                    current_url = self._extract_url(nav) or current_url
+                    session.current_url = current_url
+                    if control is not None:
+                        control.update_url(current_url)
+                    viewport.reset(at_top=True, reason="start_url_navigation")
             else:
                 viewport.reset(at_top=False, reason="initial_position_unknown")
             observation = await self._snapshot(session, current_url)
@@ -2242,6 +2253,30 @@ class AgentLoop:
                 description = await vision.describe(output, action.question)
             return "Used the configured vision model for page facts.", "", description, 4
         if isinstance(action, NavigateAction):
+            confirmation = await self._confirm_direct_url(
+                action.url,
+                session=session,
+                progress=progress,
+                step=step,
+            )
+            if (
+                confirmation
+                and control is not None
+                and control.revision != planned_revision
+            ):
+                return (
+                    "Steering invalidated the previous URL confirmation; navigation was not executed.",
+                    "",
+                    None,
+                    1,
+                )
+            if confirmation == "navigated":
+                return (
+                    "Confirmation was invalidated by user navigation; the planned URL was not opened.",
+                    "",
+                    None,
+                    1,
+                )
             payload = await self._retry_browser(
                 lambda: self.client.navigate(sid, action.url, wait_until=action.wait_until)
             )
@@ -2539,6 +2574,30 @@ class AgentLoop:
                     None,
                     observation_level,
                 )
+            confirmation = await self._confirm_direct_url(
+                action.url,
+                session=session,
+                progress=progress,
+                step=step,
+            )
+            if (
+                confirmation
+                and control is not None
+                and control.revision != planned_revision
+            ):
+                return (
+                    "Steering invalidated the previous URL confirmation; the tab action was not executed.",
+                    "",
+                    None,
+                    observation_level,
+                )
+            if confirmation == "navigated":
+                return (
+                    "Confirmation was invalidated by user navigation; the planned tab action was not executed.",
+                    "",
+                    None,
+                    observation_level,
+                )
             if reusable is not None and not may_create_additional:
                 tab_id = self._int_or_none(reusable.get("tab_id"))
                 if tab_id is not None:
@@ -2749,12 +2808,8 @@ class AgentLoop:
         key = {
             "down": "PageDown",
             "up": "PageUp",
-            "top": "Home",
-            "bottom": "End",
         }[action.direction]
         page_limit = min(action.pages, self.settings.scroll_max_pages)
-        if action.direction in {"top", "bottom"}:
-            page_limit = 1
         previous_full = session.last_observation or observation
         current_full = previous_full
         executed = 0
@@ -2785,14 +2840,10 @@ class AgentLoop:
             if current_hash == self._observation_hash(previous_full):
                 stopped_by = (
                     "page_bottom_reached"
-                    if action.direction in {"down", "bottom"}
+                    if action.direction == "down"
                     else "page_top_reached"
                 )
                 break
-            if action.direction == "bottom":
-                stopped_by = "page_bottom_reached"
-            elif action.direction == "top":
-                stopped_by = "page_top_reached"
 
         compact = self._compact_scroll_observation(
             previous_full,
@@ -2858,6 +2909,34 @@ class AgentLoop:
         body = "\n".join(selected)
         budget = max(200, int(char_limit) - len(header) - 1)
         return f"{header}\n{body[:budget]}"
+
+    async def _confirm_direct_url(
+        self,
+        url: str | None,
+        *,
+        session: ChatBrowserSession,
+        progress: ProgressCallback | None,
+        step: int,
+    ) -> str:
+        """Confirm side-effect-shaped routes regardless of how they are opened."""
+        if not url or not http_url_requires_confirmation(url):
+            return ""
+        route = self._page_route_key(url)
+        query_hint = http_url_confirmation_query(url)
+        if query_hint:
+            route = f"{route}?{query_hint}"
+        return await self._help(
+            session,
+            prompt=(
+                f"即将直接打开可能触发关键操作的地址：{route}。"
+                "请确认这是你希望执行的最终操作；确认后点击完成，取消则终止任务。"
+            ),
+            title="确认关键网址操作",
+            targets=[],
+            completion_criteria=None,
+            progress=progress,
+            step=step,
+        )
 
     async def _help(
         self,
